@@ -36,6 +36,7 @@ from Volatility_arbitrage_price_watch_EOA import resolve_token_ids
 
 __all__ = [
     "MarketFilterConfig",
+    "FilterDiagnostics",
     "OutcomeSnapshot",
     "MarketSnapshot",
     "fetch_markets",
@@ -45,7 +46,12 @@ __all__ = [
 ]
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-USER_AGENT = "VolatilityFilterEOA/2025-11"
+# 一些企业代理会拒绝未知的 UA，这里模仿主流浏览器字符串降低被拦截概率
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
+)
 
 _ORDERBOOK_CACHE: Dict[str, Any] = {}
 
@@ -367,20 +373,124 @@ class MarketFilterConfig:
     only_keywords: Tuple[str, ...] = ()
 
 
+@dataclass
+class FilterDiagnostics:
+    sample_limit: int = 3
+    total: int = 0
+    passed: int = 0
+    failures: Dict[str, int] = field(default_factory=dict)
+    samples: Dict[str, List[str]] = field(default_factory=dict)
+
+    def record_pass(self) -> None:
+        self.passed += 1
+
+    def record_failure(
+        self,
+        reason: str,
+        *,
+        snapshot: Optional[MarketSnapshot] = None,
+        market: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.failures[reason] = self.failures.get(reason, 0) + 1
+        if self.sample_limit <= 0:
+            return
+        label = None
+        if snapshot is not None:
+            label = snapshot.slug or snapshot.title
+        elif market is not None:
+            label = str(
+                market.get("slug")
+                or market.get("marketSlug")
+                or market.get("question")
+                or market.get("title")
+                or market.get("name")
+                or "(unknown)"
+            )
+        if not label:
+            return
+        samples = self.samples.setdefault(reason, [])
+        if len(samples) < self.sample_limit and label not in samples:
+            samples.append(label)
+
+    def format_report(self, elapsed_seconds: Optional[float] = None) -> str:
+        lines: List[str] = []
+        if elapsed_seconds is not None:
+            lines.append(f"[DIAG] 过滤耗时 {elapsed_seconds:.2f}s。")
+        lines.append(
+            f"[DIAG] 共评估 {self.total} 个市场，其中 {self.passed} 个通过筛选。"
+        )
+        failed = self.total - self.passed
+        if failed <= 0:
+            return "\n".join(lines)
+        lines.append(f"[DIAG] 其余 {failed} 个市场未通过筛选，原因分布如下：")
+        for reason, count in sorted(self.failures.items(), key=lambda kv: kv[1], reverse=True):
+            entry = f"  - {reason}: {count}"
+            samples = self.samples.get(reason)
+            if samples:
+                entry += " （示例: " + ", ".join(samples) + ")"
+            lines.append(entry)
+        return "\n".join(lines)
+
+
 def _http_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Optional[Any]:
-    query = parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
+    params = {k: v for k, v in (params or {}).items() if v is not None}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+    # requests 对代理与 TLS 的兼容性更好，优先尝试（与旧版本行为保持一致）。
+    try:
+        import requests  # type: ignore
+    except Exception:
+        requests = None  # type: ignore
+
+    if requests is not None:
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.JSONDecodeError, ValueError):
+            final_url = resp.url if 'resp' in locals() else url  # type: ignore[name-defined]
+            print(f"[WARN] 无法解析 JSON：{final_url}")
+            return None
+        except requests.RequestException as exc:
+            print(f"[WARN] 网络请求失败：{exc}")
+            # 若是 requests 专属问题（如模块未安装 CA），回退到 urllib
+
+    query = parse.urlencode(params)
     full_url = f"{url}?{query}" if query else url
-    req = request.Request(full_url, headers={"User-Agent": USER_AGENT})
+    req = request.Request(full_url, headers=headers)
     try:
         with request.urlopen(req, timeout=timeout) as resp:
             if resp.status >= 400:
                 raise error.HTTPError(full_url, resp.status, resp.reason, resp.headers, None)
-            data = resp.read().decode("utf-8")
+            raw = resp.read()
+            encoding = resp.headers.get("Content-Encoding", "").lower()
+            if encoding == "gzip":
+                import gzip
+
+                data = gzip.decompress(raw).decode("utf-8")
+            elif encoding == "deflate":
+                import zlib
+
+                data = zlib.decompress(raw, -zlib.MAX_WBITS).decode("utf-8")
+            else:
+                data = raw.decode("utf-8")
     except error.HTTPError as exc:
         print(f"[WARN] HTTP {exc.code} {exc.reason} when requesting {full_url}")
         return None
     except error.URLError as exc:
         print(f"[WARN] 网络请求失败：{exc}")
+        return None
+    except Exception as exc:
+        print(f"[WARN] 读取响应失败：{exc}")
         return None
     try:
         return json.loads(data)
@@ -684,49 +794,51 @@ def _keyword_hit(text: str, keywords: Sequence[str]) -> bool:
     return False
 
 
-def market_passes(snapshot: MarketSnapshot, cfg: MarketFilterConfig) -> bool:
+def market_passes_with_reason(
+    snapshot: MarketSnapshot, cfg: MarketFilterConfig
+) -> Tuple[bool, str]:
     if cfg.require_binary and ({"yes", "no"} - set(snapshot.outcomes.keys())):
-        return False
+        return False, "非二元市场"
 
     yes = snapshot.yes
     no = snapshot.no
 
     if cfg.require_trading and (not yes or not no):
-        return False
+        return False, "缺少 YES/NO outcome"
     if cfg.require_trading:
         if yes and yes.best_bid is None and yes.best_ask is None:
-            return False
+            return False, "YES 缺少买卖价"
         if no and no.best_bid is None and no.best_ask is None:
-            return False
+            return False, "NO 缺少买卖价"
 
     if cfg.require_active:
         if snapshot.is_active is False:
-            return False
+            return False, "非 active 状态"
         if snapshot.is_closed is True:
-            return False
+            return False, "市场已关闭"
     if snapshot.is_resolved:
-        return False
+        return False, "市场已结算"
 
     if cfg.min_liquidity > 0:
         if snapshot.liquidity is None or snapshot.liquidity < cfg.min_liquidity:
-            return False
+            return False, "流动性不足"
 
     if cfg.min_volume_24h > 0:
         if snapshot.volume_24h is None or snapshot.volume_24h < cfg.min_volume_24h:
-            return False
+            return False, "24h 成交量不足"
 
     if cfg.min_yes_bid is not None:
         if not yes or yes.best_bid is None or yes.best_bid < cfg.min_yes_bid:
-            return False
+            return False, "YES 买价低于阈值"
     if cfg.max_yes_ask is not None:
         if not yes or yes.best_ask is None or yes.best_ask > cfg.max_yes_ask:
-            return False
+            return False, "YES 卖价高于阈值"
     if cfg.min_no_bid is not None:
         if not no or no.best_bid is None or no.best_bid < cfg.min_no_bid:
-            return False
+            return False, "NO 买价低于阈值"
     if cfg.max_no_ask is not None:
         if not no or no.best_ask is None or no.best_ask > cfg.max_no_ask:
-            return False
+            return False, "NO 卖价高于阈值"
 
     if cfg.max_spread is not None:
         spreads: List[float] = []
@@ -737,35 +849,56 @@ def market_passes(snapshot: MarketSnapshot, cfg: MarketFilterConfig) -> bool:
             if spread is not None:
                 spreads.append(spread)
         if spreads and max(spreads) > cfg.max_spread:
-            return False
+            return False, "点差超过阈值"
 
     if cfg.max_end_hours is not None and snapshot.hours_to_end is not None:
         if snapshot.hours_to_end < 0:
-            return False
+            return False, "市场已过期"
         if snapshot.hours_to_end > cfg.max_end_hours:
-            return False
+            return False, "距离结束时间过长"
 
     if cfg.banned_keywords and _keyword_hit(snapshot.title, cfg.banned_keywords):
-        return False
+        return False, "命中排除关键字"
 
     if cfg.only_keywords and not _keyword_hit(snapshot.title, cfg.only_keywords):
-        return False
+        return False, "未命中限定关键字"
 
-    return True
+    return True, "通过"
 
 
-def filter_markets(markets: Iterable[Dict[str, Any]], cfg: MarketFilterConfig) -> List[MarketSnapshot]:
+def market_passes(snapshot: MarketSnapshot, cfg: MarketFilterConfig) -> bool:
+    passed, _ = market_passes_with_reason(snapshot, cfg)
+    return passed
+
+
+def filter_markets(
+    markets: Iterable[Dict[str, Any]],
+    cfg: MarketFilterConfig,
+    *,
+    diagnostics: Optional[FilterDiagnostics] = None,
+    allow_orderbook_backfill: bool = True,
+) -> List[MarketSnapshot]:
     snapshots: List[MarketSnapshot] = []
     for market in markets:
+        if diagnostics is not None:
+            diagnostics.total += 1
         try:
             snapshot = build_market_snapshot(market)
         except Exception as exc:
             print(f"[WARN] 市场解析失败：{exc}")
+            if diagnostics is not None:
+                reason = f"解析失败({exc.__class__.__name__})"
+                diagnostics.record_failure(reason, market=market)
             continue
-        if cfg.require_trading:
+        if cfg.require_trading and allow_orderbook_backfill:
             _maybe_backfill_quotes(snapshot)
-        if market_passes(snapshot, cfg):
+        passed, reason = market_passes_with_reason(snapshot, cfg)
+        if passed:
+            if diagnostics is not None:
+                diagnostics.record_pass()
             snapshots.append(snapshot)
+        elif diagnostics is not None:
+            diagnostics.record_failure(reason, snapshot=snapshot)
     return snapshots
 
 
@@ -846,13 +979,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--include-inactive", action="store_true", help="保留 inactive / closed 市场")
     parser.add_argument("--allow-non-binary", action="store_true", help="允许缺失 YES/NO 任一 outcome 的市场")
     parser.add_argument("--allow-illiquid", action="store_true", help="允许无买卖报价的市场")
+    parser.add_argument("--skip-orderbook", action="store_true", help="跳过订单簿补全报价，加速诊断")
 
     parser.add_argument("--exclude", nargs="*", help="标题包含任意关键字则剔除")
     parser.add_argument("--only", nargs="*", help="标题需包含任意关键字方可保留")
 
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="输出过滤统计信息，帮助确认被淘汰的原因",
+    )
+    parser.add_argument(
+        "--diagnose-samples",
+        type=int,
+        default=5,
+        help="每种淘汰原因保留的示例数量（默认 5）",
+    )
+
     args = parser.parse_args(argv)
 
     cfg = _cli_build_config(args)
+    diagnostics = FilterDiagnostics(sample_limit=args.diagnose_samples) if args.diagnose else None
 
     if args.from_file:
         markets = _load_markets_from_file(args.from_file)
@@ -869,7 +1016,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("[WARN] 未获取到任何市场，请检查网络或输入参数。")
         return 1
 
-    snapshots = filter_markets(markets, cfg)
+    start_filter = time.perf_counter()
+    snapshots = filter_markets(
+        markets,
+        cfg,
+        diagnostics=diagnostics,
+        allow_orderbook_backfill=not args.skip_orderbook,
+    )
+    elapsed = time.perf_counter() - start_filter
+
+    if diagnostics is not None:
+        print(diagnostics.format_report(elapsed_seconds=elapsed))
+
     if not snapshots:
         print("[INFO] 没有满足条件的市场。")
         return 0
