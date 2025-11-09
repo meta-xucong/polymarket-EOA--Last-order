@@ -33,6 +33,7 @@ def ws_watch_by_ids(
     label: str = "",
     on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     verbose: bool = False,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     ids = [str(x) for x in asset_ids if x]
     if not ids:
@@ -54,6 +55,8 @@ def ws_watch_by_ids(
 
         def _ping():
             while not stop_flag["v"]:
+                if stop_event and stop_event.is_set():
+                    break
                 try:
                     ws.send("PING")
                     time.sleep(10)
@@ -92,6 +95,8 @@ def ws_watch_by_ids(
 
     def on_close(ws, status_code, msg):
         stop_flag["v"] = True
+        if stop_event:
+            stop_event.set()
         if verbose:
             print(f"[{_now()}][WS][CLOSED] {status_code} {msg}")
 
@@ -107,6 +112,18 @@ def ws_watch_by_ids(
         on_close=on_close,
         header=headers,
     )
+
+    if stop_event:
+        def _watch_stop_event():
+            stop_event.wait()
+            stop_flag["v"] = True
+            try:
+                wsa.close()
+            except Exception:
+                pass
+
+        threading.Thread(target=_watch_stop_event, daemon=True).start()
+
     wsa.run_forever(
         sslopt={"cert_reqs": ssl.CERT_REQUIRED},
         ping_interval=25,
