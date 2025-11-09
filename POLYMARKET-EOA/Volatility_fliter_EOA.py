@@ -103,6 +103,26 @@ USER_AGENT = (
 )
 
 _ORDERBOOK_CACHE: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+_ORDERBOOK_METHOD_CANDIDATES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("get_market_orderbook", ("market",)),
+    ("get_market_orderbook", ("token_id",)),
+    ("get_market_orderbook", ("market_id",)),
+    ("get_order_book", ("market",)),
+    ("get_order_book", ("token_id",)),
+    ("get_order_book", ("market_id",)),
+    ("get_orderbook", ("market",)),
+    ("get_orderbook", ("token_id",)),
+    ("get_orderbook", ("market_id",)),
+    ("get_market", ("market",)),
+    ("get_market", ("token_id",)),
+    ("get_market", ("market_id",)),
+    ("get_market_data", ("market",)),
+    ("get_market_data", ("token_id",)),
+    ("get_market_data", ("market_id",)),
+    ("get_ticker", ("market",)),
+    ("get_ticker", ("token_id",)),
+    ("get_ticker", ("market_id",)),
+)
 
 
 _API_KEY_FIELDS = ("key", "apiKey", "api_key", "id", "apiId", "api_id")
