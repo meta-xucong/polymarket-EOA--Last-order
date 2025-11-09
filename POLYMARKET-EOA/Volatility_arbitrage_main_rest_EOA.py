@@ -46,6 +46,22 @@ def _api_creds_to_dict(creds) -> dict:
         return {}
     if isinstance(creds, dict):
         return creds
+    if hasattr(creds, "_asdict"):
+        try:
+            maybe_map = creds._asdict()  # type: ignore[attr-defined]
+        except Exception:
+            maybe_map = None
+        else:
+            if isinstance(maybe_map, dict):
+                return maybe_map
+    if hasattr(creds, "items"):
+        try:
+            maybe_map = dict(creds.items())  # type: ignore[arg-type]
+        except Exception:
+            maybe_map = None
+        else:
+            if isinstance(maybe_map, dict):
+                return maybe_map
     if hasattr(creds, "to_dict"):
         try:
             maybe_map = creds.to_dict()  # type: ignore[attr-defined]
@@ -81,6 +97,14 @@ def _extract_api_field(creds, *names) -> Optional[str]:
         val = mp.get(name)
         if val:
             return str(val)
+    if hasattr(creds, "__getitem__"):
+        for name in names:
+            try:
+                val = creds[name]  # type: ignore[index]
+            except Exception:
+                continue
+            if val:
+                return str(val)
     for name in names:
         if hasattr(creds, name):
             try:
@@ -89,6 +113,29 @@ def _extract_api_field(creds, *names) -> Optional[str]:
                 continue
             if val:
                 return str(val)
+    # 针对序列结构（如 tuple/list）按约定顺序取值
+    if isinstance(creds, (tuple, list)):
+        index_map = {
+            "key": 0,
+            "api_key": 0,
+            "apiKey": 0,
+            "id": 0,
+            "secret": 1,
+            "apiSecret": 1,
+            "passphrase": 2,
+            "apiPassphrase": 2,
+        }
+        for name in names:
+            idx = index_map.get(name)
+            if idx is None:
+                continue
+            if idx < len(creds):
+                try:
+                    candidate = creds[idx]
+                except Exception:
+                    continue
+                if candidate:
+                    return str(candidate)
     return None
 
 

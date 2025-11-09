@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -49,14 +50,164 @@ USER_AGENT = "VolatilityFilterEOA/2025-11"
 _ORDERBOOK_CACHE: Dict[str, Any] = {}
 
 
+_API_KEY_FIELDS = ("key", "apiKey", "api_key", "id", "apiId", "api_id")
+_API_SECRET_FIELDS = ("secret", "apiSecret", "api_secret", "apiSecretKey")
+_API_PASS_FIELDS = (
+    "passphrase",
+    "apiPassphrase",
+    "api_passphrase",
+    "apiPass",
+    "pass",
+)
+
+
+def _normalize_str(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return str(value)
+
+
+def _creds_from_mapping(mp: Any) -> Optional[Tuple[str, str, Optional[str]]]:
+    if not isinstance(mp, dict):
+        return None
+    key_val = next((mp.get(name) for name in _API_KEY_FIELDS if mp.get(name)), None)
+    secret_val = next((mp.get(name) for name in _API_SECRET_FIELDS if mp.get(name)), None)
+    pass_val = next((mp.get(name) for name in _API_PASS_FIELDS if mp.get(name)), None)
+    key_norm = _normalize_str(key_val)
+    secret_norm = _normalize_str(secret_val)
+    if key_norm and secret_norm:
+        return key_norm, secret_norm, _normalize_str(pass_val)
+    return None
+
+
+def _creds_from_object(obj: Any) -> Optional[Tuple[str, str, Optional[str]]]:
+    if obj is None:
+        return None
+    for attr in _API_KEY_FIELDS:
+        key_val = getattr(obj, attr, None)
+        if key_val:
+            break
+    else:
+        key_val = None
+    for attr in _API_SECRET_FIELDS:
+        secret_val = getattr(obj, attr, None)
+        if secret_val:
+            break
+    else:
+        secret_val = None
+    for attr in _API_PASS_FIELDS:
+        pass_val = getattr(obj, attr, None)
+        if pass_val:
+            break
+    else:
+        pass_val = None
+    key_norm = _normalize_str(key_val)
+    secret_norm = _normalize_str(secret_val)
+    if key_norm and secret_norm:
+        return key_norm, secret_norm, _normalize_str(pass_val)
+    if hasattr(obj, "to_dict"):
+        try:
+            maybe = obj.to_dict()  # type: ignore[attr-defined]
+        except Exception:
+            maybe = None
+        if maybe:
+            return _creds_from_mapping(maybe)
+    if hasattr(obj, "_asdict"):
+        try:
+            maybe = obj._asdict()  # type: ignore[attr-defined]
+        except Exception:
+            maybe = None
+        if maybe:
+            return _creds_from_mapping(maybe)
+    return None
+
+
+def _creds_from_sequence(seq: Any) -> Optional[Tuple[str, str, Optional[str]]]:
+    if not isinstance(seq, (list, tuple)) or len(seq) < 2:
+        return None
+    key_val, secret_val = seq[0], seq[1]
+    pass_val = seq[2] if len(seq) > 2 else None
+    key_norm = _normalize_str(key_val)
+    secret_norm = _normalize_str(secret_val)
+    if key_norm and secret_norm:
+        return key_norm, secret_norm, _normalize_str(pass_val)
+    return None
+
+
+def _inspect_eoa_api_creds() -> Optional[Tuple[str, str, Optional[str]]]:
+    client = get_eoa_client()
+    candidates: List[Any] = [
+        getattr(client, "api_creds", None),
+        getattr(client, "_api_creds", None),
+    ]
+    getter = getattr(client, "get_api_creds", None)
+    if callable(getter):
+        try:
+            candidates.append(getter())
+        except Exception:
+            pass
+    derive = getattr(client, "create_or_derive_api_creds", None)
+    if callable(derive):
+        try:
+            derived = derive()
+        except Exception:
+            derived = None
+        if derived:
+            candidates.append(derived)
+    direct_key = getattr(client, "api_key", None)
+    direct_secret = getattr(client, "api_secret", None)
+    if direct_key and direct_secret:
+        candidates.append({"key": direct_key, "secret": direct_secret})
+    for cand in candidates:
+        if cand is None:
+            continue
+        parsed = None
+        if isinstance(cand, dict):
+            parsed = _creds_from_mapping(cand)
+        elif isinstance(cand, (list, tuple)):
+            parsed = _creds_from_sequence(cand)
+        else:
+            parsed = _creds_from_object(cand)
+        if parsed:
+            return parsed
+    return None
+
+
+def _resolve_api_creds() -> Optional[Tuple[str, str, Optional[str]]]:
+    env_key = os.getenv("POLY_API_KEY")
+    env_secret = os.getenv("POLY_API_SECRET")
+    env_pass = os.getenv("POLY_API_PASSPHRASE") or os.getenv("POLY_API_PASS")
+    if env_key and env_secret:
+        key_clean = env_key.strip()
+        secret_clean = env_secret.strip()
+        if key_clean and secret_clean:
+            pass_clean = env_pass.strip() if env_pass and env_pass.strip() else None
+            return key_clean, secret_clean, pass_clean
+    try:
+        tup = get_api_creds_tuple()
+    except Exception:
+        tup = (None, None, None)
+    key, secret, passphrase = tup
+    if key and secret:
+        return key, secret, passphrase
+    inspected = _inspect_eoa_api_creds()
+    if inspected:
+        return inspected
+    return None
+
+
 def _describe_auth_context() -> None:
     """打印 EOA API 凭据的摘要，帮助确认脚本运行在 EOA 模式下。"""
     try:
-        api_key, api_secret, _ = get_api_creds_tuple()
+        creds = _resolve_api_creds()
     except Exception as exc:
         print(f"[WARN] 无法派生 API 凭据：{exc}")
         return
-    if api_key and api_secret:
+    if creds:
+        api_key, _, _ = creds
         key_mask = f"{api_key[:6]}***{api_key[-4:]}" if len(api_key) >= 10 else "***"
         print(f"[INFO] 已加载 EOA API credentials：{key_mask}")
     else:
