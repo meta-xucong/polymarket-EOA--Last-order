@@ -43,6 +43,7 @@ except ImportError:
     )
 from Volatility_buy_EOA import execute_auto_buy  # BUY 规范化逻辑统一交由执行器实现
 from Volatility_sell_EOA import execute_auto_sell
+from trading.execution import ExecutionResult
 
 # ========== 1) Client：优先 ws 版，回退 rest 版 ==========
 def _get_client():
@@ -806,6 +807,10 @@ def main():
         return False
 
     def _extract_price(resp: Any, fallback: float) -> float:
+        if isinstance(resp, ExecutionResult):
+            if resp.avg_price is not None:
+                return float(resp.avg_price)
+            return float(resp.last_price or fallback)
         if isinstance(resp, dict):
             for key in ("avg_price", "avgPrice", "filled_avg_price", "filledAvgPrice", "price"):
                 val = resp.get(key)
@@ -817,6 +822,10 @@ def main():
         return float(fallback)
 
     def _extract_size(resp: Any, fallback: float) -> float:
+        if isinstance(resp, ExecutionResult):
+            if resp.filled is not None and resp.filled > 0:
+                return float(resp.filled)
+            return float(resp.requested or fallback)
         if isinstance(resp, dict):
             for key in ("filled", "filled_size", "filledSize", "size"):
                 val = resp.get(key)
@@ -828,6 +837,8 @@ def main():
         return float(fallback)
 
     def _status_lower(resp: Any) -> str:
+        if isinstance(resp, ExecutionResult):
+            return (resp.status or "").lower()
         if isinstance(resp, dict):
             val = resp.get("status")
             if isinstance(val, str):
@@ -835,6 +846,15 @@ def main():
         if isinstance(resp, str):
             return resp.lower()
         return ""
+
+    def _status_message(resp: Any) -> str:
+        if isinstance(resp, ExecutionResult):
+            msg = resp.message or resp.status
+            return str(msg) if msg is not None else ""
+        if isinstance(resp, dict):
+            msg = resp.get("message") or resp.get("status")
+            return str(msg) if msg is not None else ""
+        return str(resp)
 
     def _parse_price_change(pc: Dict[str, Any]) -> Tuple[float, float, float]:
         def _to_float(val: Any) -> Optional[float]:
@@ -1013,7 +1033,7 @@ def main():
 
     threading.Thread(target=_input_listener, daemon=True).start()
 
-    success_status = {"success", "matched", "filled", "complete", "completed"}
+    success_status = {"success", "matched", "filled", "complete", "completed", "partial", "executed"}
     position_size: Optional[float] = None
     last_order_size: Optional[float] = None
     last_log = 0.0
@@ -1134,7 +1154,7 @@ def main():
                         f"[STATE] 买入成交 -> price={fill_px:.4f} size={position_size:.4f}"
                     )
                 else:
-                    reason = resp.get("message") if isinstance(resp, dict) else str(resp)
+                    reason = _status_message(resp)
                     print(f"[WARN] 买入未成交：{reason}")
                     strategy.on_reject(reason if isinstance(reason, str) else None)
 
@@ -1176,7 +1196,7 @@ def main():
                     buy_cooldown_until = time.time() + 15.0
                     print(f"[STATE] 卖出成交 -> price={fill_px:.4f}")
                 else:
-                    reason = resp.get("message") if isinstance(resp, dict) else str(resp)
+                    reason = _status_message(resp)
                     print(f"[WARN] 卖出未成交：{reason}")
                     strategy.on_reject(reason if isinstance(reason, str) else None)
 
