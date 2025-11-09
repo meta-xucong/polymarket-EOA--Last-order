@@ -773,24 +773,19 @@ def _apply_price_fallbacks_from_market(
 
 def _extract_best_prices(orderbook: Any) -> Tuple[Optional[float], Optional[float]]:
     if not isinstance(orderbook, MappingABC):
-        raise TypeError("订单簿响应格式错误：缺少映射结构")
+        return None, None
 
-    payload = orderbook
-    if "data" in payload and isinstance(payload.get("data"), MappingABC):
-        payload = payload["data"]
-
+    payload: Any = orderbook
+    if isinstance(payload.get("data"), MappingABC):
+        payload = payload.get("data")
     if not isinstance(payload, MappingABC):
-        raise TypeError("订单簿响应格式错误：data 字段不是映射")
-
-    if "bids" not in payload or "asks" not in payload:
-        missing = {key for key in ("bids", "asks") if key not in payload}
-        raise KeyError(f"订单簿缺少必要字段：{', '.join(sorted(missing))}")
+        return None, None
 
     def _first_price(levels: Any) -> Optional[float]:
         if isinstance(levels, MappingABC):
             levels = levels.get("levels")
         if not isinstance(levels, IterableABC) or isinstance(levels, (str, bytes, bytearray)):
-            raise TypeError("订单簿价格梯度格式错误")
+            return _coerce_float(levels)
         for level in levels:
             if isinstance(level, MappingABC):
                 price = _coerce_float(level.get("price"))
@@ -800,20 +795,10 @@ def _extract_best_prices(orderbook: Any) -> Tuple[Optional[float], Optional[floa
                 return price
         return None
 
-    return _first_price(payload["bids"]), _first_price(payload["asks"])
+    return _first_price(payload.get("bids")), _first_price(payload.get("asks"))
 
 
-def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Optional[float]]:
-    orderbook = client.get_market_orderbook(market=token_id)
-
-    if isinstance(orderbook, tuple) and len(orderbook) == 2:
-        orderbook = orderbook[1]
-
-    bid, ask = _extract_best_prices(orderbook)
-    return bid, ask
-
-
-def _extract_best_quote(payload: Any, *, side: str) -> Optional[float]:
+def _extract_best_side(payload: Any, *, side: str) -> Optional[float]:
     numeric = _coerce_float(payload)
     if numeric is not None:
         return numeric
@@ -843,6 +828,8 @@ def _extract_best_quote(payload: Any, *, side: str) -> Optional[float]:
                 "best_bid",
                 "bestBid",
                 "bid",
+                "best_buy",
+                "bestBuy",
                 "highest_bid",
                 "highestBid",
                 "buy",
@@ -852,66 +839,63 @@ def _extract_best_quote(payload: Any, *, side: str) -> Optional[float]:
                 "bid_levels",
                 "buy_orders",
                 "buyOrders",
-                "orders",
             )
 
         for key in primary_keys:
             if key in payload:
-                extracted = _extract_best_quote(payload[key], side=side)
+                extracted = _extract_best_side(payload[key], side=side)
                 if extracted is not None:
                     return extracted
 
         for key in ladder_keys:
-            if key not in payload:
-                continue
-            ladder = payload[key]
-            if isinstance(ladder, IterableABC) and not isinstance(
-                ladder, (str, bytes, bytearray)
-            ):
-                for entry in ladder:
-                    if isinstance(entry, MappingABC):
-                        candidate = _coerce_float(
-                            entry.get("price")
-                            or entry.get("limitPrice")
-                            or entry.get("limit_price")
-                            or entry.get("p")
-                        )
-                        if candidate is not None:
-                            return candidate
-                        extracted = _extract_best_quote(entry, side=side)
+            if key in payload:
+                ladder = payload[key]
+                if isinstance(ladder, IterableABC) and not isinstance(ladder, (str, bytes, bytearray)):
+                    for entry in ladder:
+                        if isinstance(entry, MappingABC) and "price" in entry:
+                            candidate = _coerce_float(entry["price"])
+                            if candidate is not None:
+                                return candidate
+                        extracted = _extract_best_side(entry, side=side)
                         if extracted is not None:
                             return extracted
-                    elif isinstance(entry, IterableABC) and not isinstance(
-                        entry, (str, bytes, bytearray)
-                    ):
-                        for item in entry:
-                            extracted = _extract_best_quote(item, side=side)
-                            if extracted is not None:
-                                return extracted
 
         for value in payload.values():
-            extracted = _extract_best_quote(value, side=side)
+            extracted = _extract_best_side(value, side=side)
             if extracted is not None:
                 return extracted
         return None
 
     if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
-            extracted = _extract_best_quote(item, side=side)
+            extracted = _extract_best_side(item, side=side)
             if extracted is not None:
                 return extracted
+        return None
 
     return None
 
 
 def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Optional[float]]:
-    for name, arg_keys in _ORDERBOOK_METHOD_CANDIDATES:
+    method_candidates = (
+        ("get_market_orderbook", {"market": token_id}),
+        ("get_market_orderbook", {"token_id": token_id}),
+        ("get_order_book", {"market": token_id}),
+        ("get_order_book", {"token_id": token_id}),
+        ("get_orderbook", {"market": token_id}),
+        ("get_orderbook", {"token_id": token_id}),
+        ("get_market", {"market": token_id}),
+        ("get_market", {"token_id": token_id}),
+        ("get_market_data", {"market": token_id}),
+        ("get_market_data", {"token_id": token_id}),
+        ("get_ticker", {"market": token_id}),
+        ("get_ticker", {"token_id": token_id}),
+    )
+
+    for name, kwargs in method_candidates:
         fn = getattr(client, name, None)
         if not callable(fn):
             continue
-
-        kwargs = {key: token_id for key in arg_keys}
-
         try:
             resp = fn(**kwargs)
         except TypeError:
@@ -919,22 +903,21 @@ def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Opt
         except Exception:
             continue
 
-        payload = resp
+        payload: Any = resp
         if isinstance(resp, tuple) and len(resp) == 2:
             payload = resp[1]
-
-        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+        if isinstance(payload, MappingABC) and isinstance(payload.get("data"), MappingABC):
             payload = payload.get("data")
+
+        bid = _extract_best_side(payload, side="bid")
+        ask = _extract_best_side(payload, side="ask")
+        if bid is not None or ask is not None:
+            return bid, ask
 
         if isinstance(payload, MappingABC):
             bid, ask = _extract_best_prices(payload)
             if bid is not None or ask is not None:
                 return bid, ask
-
-        bid = _extract_best_quote(payload, side="bid")
-        ask = _extract_best_quote(payload, side="ask")
-        if bid is not None or ask is not None:
-            return bid, ask
 
     return None, None
 
@@ -1206,7 +1189,19 @@ def _format_trace_numeric(value: Any) -> str:
 
 def _format_trace_sequence_display(raw: Any, *, limit: int = 4, numeric: bool = False) -> str:
     if numeric:
-        seq = _ensure_sequence(raw)
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                seq: Tuple[Any, ...] = tuple()
+            else:
+                seq = tuple(parsed) if isinstance(parsed, (list, tuple)) else tuple()
+        elif isinstance(raw, (list, tuple)):
+            seq = tuple(raw)
+        elif raw is None:
+            seq = tuple()
+        else:
+            seq = (raw,)
     elif isinstance(raw, (list, tuple)):
         seq = tuple(raw)
     else:
