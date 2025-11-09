@@ -1,8 +1,6 @@
-# Volatility_arbitrage_run_EOA.py
+# Volatility_arbitrage_run.py
 # -*- coding: utf-8 -*-
 """
-EOA 版本运行入口，导入新的客户端/执行器，其他流程与 Safe 版一致。
-
 运行入口（循环策略版）：
 - 事件页 /event/<slug>：列出子问题并选择（与老版一致）。
 - 新增：
@@ -17,30 +15,21 @@ import os
 import time
 import threading
 import re
-import hmac
-import hashlib
-import json
 from queue import Queue, Empty
-from typing import Dict, Any, Tuple, List, Optional
-from decimal import Decimal, ROUND_UP, ROUND_DOWN
+from typing import Dict, Any, Iterable, Tuple, List, Optional
+from decimal import Decimal, ROUND_UP
+import hashlib
+import hmac
+import json
 import requests
 from datetime import datetime, timezone
-# 策略状态机：EOA 版本文件名已更新，优先导入新模块。
-try:
-    from Volatility_arbitrage_strategy_EOA import (
-        StrategyConfig,
-        VolArbStrategy,
-        ActionType,
-        Action,
-    )
-except ImportError:
-    # 兼容旧目录结构，若仍保留历史文件名则继续尝试旧模块。
-    from Volatility_arbitrage_strategy import (  # type: ignore
-        StrategyConfig,
-        VolArbStrategy,
-        ActionType,
-        Action,
-    )
+from urllib.parse import urlencode
+from Volatility_arbitrage_strategy_EOA import (
+    StrategyConfig,
+    VolArbStrategy,
+    ActionType,
+    Action,
+)
 from Volatility_buy_EOA import execute_auto_buy  # BUY 规范化逻辑统一交由执行器实现
 from Volatility_sell_EOA import execute_auto_sell
 from trading.execution import ExecutionResult
@@ -70,9 +59,10 @@ try:
     from Volatility_arbitrage_main_ws_EOA import ws_watch_by_ids
 except Exception as e:
     print("[ERR] 无法从 Volatility_arbitrage_main_ws_EOA 导入 ws_watch_by_ids：", e)
+    sys.exit(1)
 
-CLOB_API_HOST = "https://clob.polymarket.com"
 GAMMA_ROOT = "https://gamma-api.polymarket.com"
+DATA_API_ROOT = "https://data-api.polymarket.com"
 
 # ===== 旧版解析器（复刻 + 极小修正） =====
 def _parse_yes_no_ids_literal(source: str) -> Tuple[Optional[str], Optional[str]]:
@@ -142,6 +132,18 @@ def _parse_timestamp(val: Any) -> Optional[float]:
     return None
 
 
+def _coerce_positive_float(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return None
+    if num > 0:
+        return num
+    return None
+
+
 def _market_meta_from_obj(m: dict) -> Dict[str, Any]:
     meta: Dict[str, Any] = {}
     if not isinstance(m, dict):
@@ -188,6 +190,29 @@ def _market_meta_from_obj(m: dict) -> Dict[str, Any]:
     if "end_ts" not in meta and "resolved_ts" in meta:
         meta["end_ts"] = meta["resolved_ts"]
 
+    for key in (
+        "minimumOrderSize",
+        "minimum_order_size",
+        "minOrderSize",
+        "min_order_size",
+    ):
+        size_val = _coerce_positive_float(m.get(key))
+        if size_val is not None:
+            meta["minimum_order_size"] = size_val
+            break
+
+    for key in (
+        "minimumTickSize",
+        "minimum_tick_size",
+        "minTickSize",
+        "min_tick_size",
+        "tickSize",
+    ):
+        tick_val = _coerce_positive_float(m.get(key))
+        if tick_val is not None:
+            meta["minimum_tick_size"] = tick_val
+            break
+
     meta["raw"] = m
     return meta
 
@@ -233,35 +258,324 @@ def _extract_position_size(status: Dict[str, Any]) -> float:
     return 0.0
 
 
-def _should_attempt_claim(
-    meta: Dict[str, Any],
-    status: Dict[str, Any],
-    closed_by_ws: bool,
-) -> bool:
-    pos_size = _extract_position_size(status)
-    if pos_size <= 0:
-        return False
-    if closed_by_ws:
-        return True
-    return _market_has_ended(meta)
-
-
 def _resolve_client_host(client) -> str:
-    env_host = os.getenv("POLY_HOST")
-    if isinstance(env_host, str) and env_host.strip():
-        return env_host.strip().rstrip("/")
+    candidates = [
+        getattr(client, "host", None),
+        getattr(client, "_host", None),
+        getattr(client, "api_url", None),
+        getattr(client, "base_url", None),
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        if isinstance(cand, str):
+            host = cand.strip()
+            if not host:
+                continue
+            if host.startswith("http://") or host.startswith("https://"):
+                return host.rstrip("/")
+            return f"https://{host.lstrip('/')}".rstrip("/")
+    return os.getenv("POLY_HOST", "https://clob.polymarket.com").rstrip("/")
 
-    for attr in ("host", "_host", "base_url", "api_url"):
-        val = getattr(client, attr, None)
-        if isinstance(val, str) and val.strip():
-            host = val.strip().rstrip("/")
-            if "gamma-api" in host:
-                return host.replace("gamma-api", "clob")
-            return host
 
-    return CLOB_API_HOST
+def _sign_payload(secret: str, timestamp: str, method: str, path: str, body: str = "") -> str:
+    key = secret.encode("utf-8")
+    payload = (timestamp + method.upper() + path + (body or "")).encode("utf-8")
+    return hmac.new(key, payload, hashlib.sha256).hexdigest()
 
 
+def _signed_request(
+    client,
+    method: str,
+    path: str,
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+):
+    creds = _extract_api_creds(client)
+    if not creds:
+        raise RuntimeError("缺少 API Key/Secret，无法签名 HTTP 请求。")
+
+    host = _resolve_client_host(client)
+    query = ""
+    if params:
+        query = "?" + urlencode(params, doseq=True)
+    url = f"{host}{path}{query}"
+
+    body = ""
+    if payload is not None:
+        body = json.dumps(payload, separators=(",", ":"))
+
+    ts = str(int(time.time() * 1000))
+    signature_path = f"{path}{query}" if query else path
+    signature = _sign_payload(creds["secret"], ts, method.upper(), signature_path, body)
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": creds["key"],
+        "X-API-Signature": signature,
+        "X-API-Timestamp": ts,
+    }
+
+    request_fn = getattr(requests, method.lower())
+    try:
+        resp = request_fn(url, data=body or None, headers=headers, timeout=10)
+    except Exception as exc:
+        raise RuntimeError(f"请求 {url} 失败：{exc}") from exc
+    try:
+        data = resp.json()
+    except ValueError:
+        data = resp.text
+    return resp.status_code, data
+
+
+def _extract_positions_from_data_api_response(payload: Any) -> Optional[List[Dict[str, Any]]]:
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+    return None
+
+
+def _describe_payload_shape(raw: Any) -> str:
+    try:
+        if raw is None:
+            return "None"
+        if isinstance(raw, dict):
+            keys = list(raw.keys())
+            if not keys:
+                return "dict(keys=∅)"
+            preview = ", ".join(str(k) for k in keys[:5])
+            if len(keys) > 5:
+                preview += ", …"
+            return f"dict(keys={preview})"
+        if isinstance(raw, list):
+            length = len(raw)
+            if not raw:
+                return "list(len=0)"
+            first_type = type(raw[0]).__name__
+            return f"list(len={length}, first={first_type})"
+        if isinstance(raw, tuple):
+            return f"tuple(len={len(raw)})"
+        if isinstance(raw, set):
+            return f"set(len={len(raw)})"
+        return type(raw).__name__
+    except Exception:
+        return type(raw).__name__
+
+
+def _preview_payload(raw: Any, limit: int = 160) -> str:
+    try:
+        if isinstance(raw, (dict, list)):
+            text = json.dumps(raw, ensure_ascii=False)  # type: ignore[arg-type]
+        else:
+            text = str(raw)
+    except Exception:
+        text = repr(raw)
+    text = text.replace("\n", " ")
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _extract_token_id_from_position(position: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(position, dict):
+        return None
+    token_keys = (
+        "tokenId",
+        "token_id",
+        "token",
+        "asset",
+        "asset_id",
+        "assetId",
+        "clobTokenId",
+    )
+    for key in token_keys:
+        val = position.get(key)
+        if isinstance(val, dict):
+            nested = (
+                val.get("id")
+                or val.get("tokenId")
+                or val.get("token_id")
+                or val.get("assetId")
+                or val.get("asset_id")
+            )
+            if nested:
+                return str(nested)
+        elif val:
+            return str(val)
+
+    side = str(
+        position.get("outcome")
+        or position.get("token_side")
+        or position.get("side")
+        or position.get("direction")
+        or ""
+    ).upper()
+    yes_id = position.get("yesToken") or position.get("yes_token") or position.get("yesTokenId")
+    no_id = position.get("noToken") or position.get("no_token") or position.get("noTokenId")
+    if side == "YES" and yes_id:
+        return str(yes_id)
+    if side == "NO" and no_id:
+        return str(no_id)
+    return None
+
+
+def _extract_position_amount(position: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(position, dict):
+        return None
+    keys = (
+        "position_size",
+        "position",
+        "size",
+        "net_position",
+        "netPosition",
+        "quantity",
+        "amount",
+        "balance",
+        "shares",
+        "tokens",
+        "available",
+        "tokenBalance",
+        "holdings",
+    )
+    for key in keys:
+        val = position.get(key)
+        if val is None:
+            continue
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            continue
+        if abs(num) <= 1e-9:
+            return 0.0
+        return abs(num)
+    return None
+
+
+def _is_balance_exhausted_error(message: Optional[str]) -> bool:
+    if not message:
+        return False
+    lowered = str(message).lower()
+    keywords = [
+        "not enough balance",
+        "insufficient balance",
+        "not enough allowance",
+        "insufficient allowance",
+    ]
+    return any(key in lowered for key in keywords)
+
+
+def _resolve_positions_address(client) -> Optional[str]:
+    # Data-API 通过公开地址查询仓位，优先使用客户端暴露的钱包/代理地址。
+    wallet = _extract_wallet_address(client)
+    if wallet:
+        return wallet
+    env_addr = os.getenv("POLY_POSITIONS_ADDRESS")
+    if env_addr:
+        normalized = _normalize_wallet_address(env_addr)
+        if normalized:
+            return normalized
+    return None
+
+
+def _fetch_positions_from_data_api(
+    client,
+    *,
+    redeemable: Optional[bool] = None,
+) -> Tuple[List[Dict[str, Any]], bool, str]:
+    address = _resolve_positions_address(client)
+    if not address:
+        return [], False, "未能确定仓位查询地址（请确认 funder/代理钱包）"
+
+    limit = 500
+    offset = 0
+    aggregated: List[Dict[str, Any]] = []
+    params: Dict[str, Any] = {
+        "user": address,
+        "sizeThreshold": 0,
+        "limit": limit,
+    }
+    if redeemable is not None:
+        params["redeemable"] = "true" if redeemable else "false"
+
+    while True:
+        params["offset"] = offset
+        try:
+            resp = requests.get(
+                f"{DATA_API_ROOT}/positions", params=params, timeout=10
+            )
+        except requests.RequestException as exc:
+            return [], False, f"data-api 请求失败：{exc}"
+
+        if resp.status_code == 404:
+            return [], True, f"data-api positions({address})"
+        try:
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            return [], False, f"data-api 返回错误：{exc}"
+
+        try:
+            payload = resp.json()
+        except ValueError:
+            return [], False, "data-api 返回内容非 JSON"
+
+        page_positions = _extract_positions_from_data_api_response(payload)
+        if page_positions is None:
+            detail = _describe_payload_shape(payload)
+            preview = _preview_payload(payload)
+            return [], False, f"data-api 未识别的返回格式：{detail} 示例={preview}"
+
+        aggregated.extend(page_positions)
+
+        if len(page_positions) < limit:
+            break
+
+        total = None
+        if isinstance(payload, dict):
+            meta = payload.get("meta")
+            if isinstance(meta, dict):
+                total_val = meta.get("total")
+                try:
+                    total = int(total_val)
+                except (TypeError, ValueError):
+                    total = None
+        offset += limit
+        if total is not None and offset >= total:
+            break
+
+    return aggregated, True, f"data-api positions({address})"
+
+
+def _fetch_positions_any(client) -> Tuple[List[Dict[str, Any]], bool, str]:
+    return _fetch_positions_from_data_api(client)
+
+
+def _get_remote_position_size(
+    client,
+    token_id: str,
+    *,
+    tolerance: float = 1e-6,
+) -> Tuple[Optional[float], bool, str]:
+    positions, success, info = _fetch_positions_any(client)
+    if not success:
+        return None, False, info
+
+    target = str(token_id)
+    for pos in positions:
+        tid = _extract_token_id_from_position(pos)
+        if tid and str(tid) == target:
+            amount = _extract_position_amount(pos)
+            if amount is None:
+                return None, False, f"无法解析仓位数量（{info}）"
+            if amount <= tolerance:
+                return 0.0, True, info
+            return float(amount), True, info
+    return 0.0, True, info
 def _extract_api_creds(client) -> Optional[Dict[str, str]]:
     def _pair_from_mapping(mp: Dict[str, Any]) -> Optional[Dict[str, str]]:
         if not isinstance(mp, dict):
@@ -342,87 +656,91 @@ def _extract_api_creds(client) -> Optional[Dict[str, str]]:
     return None
 
 
-def _sign_payload(secret: str, timestamp: str, method: str, path: str, body: str) -> str:
-    payload = f"{timestamp}{method.upper()}{path}{body}"
-    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-
-
-def _claim_via_http(client, market_id: str, token_id: Optional[str]) -> bool:
-    creds = _extract_api_creds(client)
-    if not creds:
-        print("[CLAIM] 当前客户端缺少 API 凭证信息，无法调用 HTTP claim 接口。")
-        return False
-
-    host = _resolve_client_host(client)
-    path = "/v1/user/clob/positions/claim"
-    url = f"{host}{path}"
-    payload: Dict[str, Any] = {"market": market_id}
-    if token_id:
-        payload["tokenIds"] = [token_id]
-
-    body = json.dumps(payload, separators=(",", ":"))
-    ts = str(int(time.time() * 1000))
-    signature = _sign_payload(creds["secret"], ts, "POST", path, body)
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-Key": creds["key"],
-        "X-API-Signature": signature,
-        "X-API-Timestamp": ts,
-    }
-
-    try:
-        resp = requests.post(url, data=body, headers=headers, timeout=10)
-    except Exception as exc:
-        print(f"[CLAIM] 请求 {url} 时出现异常：{exc}")
-        return False
-
-    if resp.status_code == 404:
-        print("[CLAIM] 目标 claim 接口返回 404，请确认所使用的 Clob API 版本是否支持自动 claim。")
-        return False
-    if resp.status_code >= 500:
-        print(f"[CLAIM] 服务端 {resp.status_code} 错误：{resp.text}")
-        return False
-    if resp.status_code in (401, 403):
-        print(f"[CLAIM] 接口拒绝访问（{resp.status_code}）：{resp.text}")
-        return False
-
-    try:
-        data = resp.json()
-    except ValueError:
-        data = resp.text
-
-    print(f"[CLAIM] HTTP {path} 返回状态 {resp.status_code}，响应：{data}")
-    if isinstance(data, dict) and data.get("error"):
-        return False
-    return resp.ok
-
-
-def _attempt_claim(client, meta: Dict[str, Any], token_id: str) -> None:
-    market_id = meta.get("market_id") if isinstance(meta, dict) else None
-    print(f"[CLAIM] 检测到需处理的未平仓仓位，token_id={token_id}，开始尝试 claim…")
-    if not market_id:
-        print("[CLAIM] 未找到 market_id，无法自动 claim，请手动处理。")
-        return
-
-    claim_fn = getattr(client, "claim_positions", None)
-    if callable(claim_fn):
-        claim_kwargs = {"market": market_id}
-        if token_id:
-            claim_kwargs["token_ids"] = [token_id]
+def _normalize_wallet_address(val: Any) -> Optional[str]:
+    if not val:
+        return None
+    if isinstance(val, str):
+        text = val.strip()
+        return text or None
+    if isinstance(val, (bytes, bytearray)):
         try:
-            print(f"[CLAIM] 尝试调用 claim_positions({claim_kwargs})…")
-            resp = claim_fn(**claim_kwargs)
-            print(f"[CLAIM] 响应: {resp}")
-            return
-        except TypeError as exc:
-            print(f"[CLAIM] claim_positions 参数不匹配: {exc}，改用 HTTP 接口。")
-        except Exception as exc:
-            print(f"[CLAIM] 调用 claim_positions 失败: {exc}，改用 HTTP 接口。")
+            text = val.decode("utf-8").strip()
+        except Exception:
+            return None
+        return text or None
+    if isinstance(val, dict):
+        for key in (
+            "address",
+            "wallet",
+            "wallet_address",
+            "walletAddress",
+            "account",
+            "owner",
+            "public",
+        ):
+            nested = val.get(key)
+            normalized = _normalize_wallet_address(nested)
+            if normalized:
+                return normalized
+        return None
+    try:
+        text = str(val).strip()
+    except Exception:
+        return None
+    return text or None
 
-    if _claim_via_http(client, market_id, token_id):
-        return
 
-    print("[CLAIM] 未找到可用的 claim 方法，请手动处理。")
+def _extract_wallet_address(client) -> Optional[str]:
+    attr_names = (
+        "wallet_address",
+        "walletAddress",
+        "address",
+        "owner_address",
+        "ownerAddress",
+        "public_address",
+        "publicAddress",
+        "account_address",
+        "accountAddress",
+        "account",
+        "wallet",
+        "default_address",
+        "defaultAddress",
+        "funder",
+    )
+    for name in attr_names:
+        try:
+            raw = getattr(client, name)
+        except Exception:
+            continue
+        normalized = _normalize_wallet_address(raw)
+        if normalized:
+            return normalized
+
+    getter_names = (
+        "get_wallet_address",
+        "get_wallet",
+        "get_address",
+        "get_owner",
+        "get_account",
+        "get_funder",
+        "default_account",
+        "default_wallet",
+    )
+    for name in getter_names:
+        fn = getattr(client, name, None)
+        if not callable(fn):
+            continue
+        try:
+            raw = fn()
+        except TypeError:
+            continue
+        except Exception:
+            continue
+        normalized = _normalize_wallet_address(raw)
+        if normalized:
+            return normalized
+    return None
+
 
 def _http_json(url: str, params=None) -> Optional[Any]:
     try:
@@ -552,48 +870,30 @@ def _resolve_with_fallback(source: str) -> Tuple[str, str, str, Dict[str, Any]]:
     raise ValueError("子问题未包含 tokenId，且兜底解析失败。")
 
 # ====== 下单执行工具 ======
-def _floor(x: float, dp: int) -> float:
-    q = Decimal(str(x)).quantize(Decimal("1." + "0"*dp), rounding=ROUND_DOWN)
-    return float(q)
+def _place_buy(
+    client,
+    token_id: str,
+    price: float,
+    size: float,
+    *,
+    min_order_size: float = 0.0,
+    tick_size: float = 0.0,
+) -> ExecutionResult:
+    return execute_auto_buy(
+        client=client,
+        token_id=token_id,
+        price=price,
+        size=size,
+        min_order_size=min_order_size,
+        tick_size=tick_size,
+    )
 
-def _normalize_sell_pair(price: float, size: float) -> Tuple[float, float]:
-    # 价格 4dp；份数 2dp（下单时再 floor 一次，确保不超）
-    return _floor(price, 4), _floor(size, 2)
 
-def _place_buy_fak(client, token_id: str, price: float, size: float) -> Dict[str, Any]:
-    return execute_auto_buy(client=client, token_id=token_id, price=price, size=size)
-
-def _place_sell_fok(client, token_id: str, price: float, size: float) -> Dict[str, Any]:
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import SELL
-    eff_p, eff_s = _normalize_sell_pair(price, size)
-    order = OrderArgs(token_id=str(token_id), side=SELL, price=float(eff_p), size=float(eff_s))
-    signed = client.create_order(order)
-    return client.post_order(signed, OrderType.FOK)
+def _place_sell(client, token_id: str, price: float, size: float) -> ExecutionResult:
+    return execute_auto_sell(client=client, token_id=token_id, price=price, size=size)
 
 # ===== 主流程 =====
-
-
-def _ensure_api_creds_ok():
-    """创建客户端并检查是否正确派生了 API 凭证。"""
-    try:
-        client = _get_client()
-    except SystemExit:
-        return False
-    except Exception as e:
-        print("[ERR] 创建 ClobClient 失败：", e)
-        return False
-    creds = _extract_api_creds(client)
-    if creds and creds.get("key") and creds.get("secret"):
-        print(f"[OK] 已获取 API 凭证（脱敏）：{creds.get('key')[:8]}...")
-        return True
-    print("[ERR] 仍缺少 API 凭证三件套（至少需要 key/secret）。")
-    return False
-
-
 def main():
-    if not _ensure_api_creds_ok():
-        raise SystemExit(1)
     client = _get_client()
     creds_check = _extract_api_creds(client)
     if not creds_check or not creds_check.get("key") or not creds_check.get("secret"):
@@ -614,6 +914,13 @@ def main():
     market_meta = market_meta or {}
     print(f"[INFO] 市场/子问题标题: {title}")
     print(f"[INFO] 解析到 tokenIds: YES={yes_id} | NO={no_id}")
+
+    min_order_size_hint = _coerce_positive_float(market_meta.get("minimum_order_size"))
+    tick_size_hint = _coerce_positive_float(market_meta.get("minimum_tick_size"))
+    if min_order_size_hint:
+        print(f"[INFO] 市场最小下单份数: {min_order_size_hint}")
+    if tick_size_hint:
+        print(f"[INFO] 市场价格最小跳动: {tick_size_hint}")
 
     def _fmt_ts(ts_val: Optional[float]) -> Optional[str]:
         if ts_val is None:
@@ -662,8 +969,31 @@ def main():
         return
     token_id = yes_id if side == "YES" else no_id
 
+    print("请输入倒计时提醒起始分钟数（默认 5）：")
+    countdown_input = input().strip()
+    try:
+        countdown_minutes = float(countdown_input) if countdown_input else 5.0
+    except Exception:
+        print("[ERR] 倒计时起始分钟数非法，退出。")
+        return
+    if countdown_minutes < 0:
+        print("[ERR] 倒计时起始分钟数不可为负，退出。")
+        return
+    countdown_display_seconds = countdown_minutes * 60.0
+
     print("请输入买入份数（留空=按 $1 反推）：")
     size_in = input().strip()
+    print("请输入买入实时价格下限（默认 0.25，低于该实时价格不买入）：")
+    min_price_input = input().strip()
+    try:
+        min_realtime_price = float(min_price_input) if min_price_input else 0.25
+    except Exception:
+        print("[ERR] 买入实时价格下限非法，退出。")
+        return
+    if min_realtime_price < 0:
+        print("[ERR] 买入实时价格下限不可为负，退出。")
+        return
+
     print("请输入买入触发价（对标 ask，如 0.35，留空表示仅依赖跌幅触发）：")
     buy_px_in = input().strip()
     buy_threshold = None
@@ -698,18 +1028,24 @@ def main():
         print("[ERR] 盈利百分比非法，退出。")
         return
 
+    print("是否启用“每次卖出后将下一次买入跌幅阈值+1%（上限20%）”的动态功能？(默认启用，输入 n/N 禁用)：")
+    incremental_flag = input().strip().lower()
+    enable_incremental_drop_pct = incremental_flag not in {"n", "no", "0", "false"}
+
     cfg = StrategyConfig(
         token_id=token_id,
         buy_price_threshold=buy_threshold,
         drop_window_minutes=drop_window,
         drop_pct=drop_pct,
         profit_pct=profit_pct,
+        enable_incremental_drop_pct=enable_incremental_drop_pct,
     )
     strategy = VolArbStrategy(cfg)
 
     latest: Dict[str, Dict[str, Any]] = {}
     action_queue: Queue[Action] = Queue()
     stop_event = threading.Event()
+    countdown_phase_event = threading.Event()
     market_closed_detected = False
 
     slug_for_refresh = ""
@@ -738,6 +1074,18 @@ def main():
         if isinstance(m_obj, dict):
             refreshed = _market_meta_from_obj(m_obj)
             if refreshed:
+                if (
+                    market_meta
+                    and "minimum_order_size" in market_meta
+                    and "minimum_order_size" not in refreshed
+                ):
+                    refreshed["minimum_order_size"] = market_meta["minimum_order_size"]
+                if (
+                    market_meta
+                    and "minimum_tick_size" in market_meta
+                    and "minimum_tick_size" not in refreshed
+                ):
+                    refreshed["minimum_tick_size"] = market_meta["minimum_tick_size"]
                 market_meta = refreshed
                 new_deadline = _calc_deadline(market_meta)
                 if new_deadline:
@@ -810,7 +1158,11 @@ def main():
         if isinstance(resp, ExecutionResult):
             if resp.avg_price is not None:
                 return float(resp.avg_price)
-            return float(resp.last_price or fallback)
+            if resp.last_price is not None:
+                return float(resp.last_price)
+            if resp.limit_price is not None:
+                return float(resp.limit_price)
+            return float(fallback)
         if isinstance(resp, dict):
             for key in ("avg_price", "avgPrice", "filled_avg_price", "filledAvgPrice", "price"):
                 val = resp.get(key)
@@ -823,9 +1175,7 @@ def main():
 
     def _extract_size(resp: Any, fallback: float) -> float:
         if isinstance(resp, ExecutionResult):
-            if resp.filled is not None and resp.filled > 0:
-                return float(resp.filled)
-            return float(resp.requested or fallback)
+            return float(resp.filled or fallback)
         if isinstance(resp, dict):
             for key in ("filled", "filled_size", "filledSize", "size"):
                 val = resp.get(key)
@@ -836,9 +1186,53 @@ def main():
                         pass
         return float(fallback)
 
+    def _extract_remaining(resp: Any, requested: float) -> Optional[float]:
+        if isinstance(resp, ExecutionResult):
+            return float(resp.remaining)
+        if isinstance(resp, dict):
+            for key in (
+                "remaining",
+                "remaining_size",
+                "remainingSize",
+                "open_size",
+                "openSize",
+                "unfilled",
+                "unfilledSize",
+            ):
+                val = resp.get(key)
+                if val is not None:
+                    try:
+                        return max(float(val), 0.0)
+                    except Exception:
+                        pass
+
+            filled_val: Optional[float] = None
+            for key in ("filled", "filled_size", "filledSize", "size"):
+                val = resp.get(key)
+                if val is not None:
+                    try:
+                        filled_val = float(val)
+                        break
+                    except Exception:
+                        continue
+            if filled_val is None:
+                return None
+
+            try:
+                requested_f = float(requested)
+            except (TypeError, ValueError):
+                return None
+
+            remaining = requested_f - filled_val
+            if remaining < 0 and abs(remaining) <= 1e-6:
+                remaining = 0.0
+            return max(remaining, 0.0)
+
+        return None
+
     def _status_lower(resp: Any) -> str:
         if isinstance(resp, ExecutionResult):
-            return (resp.status or "").lower()
+            return resp.status.lower()
         if isinstance(resp, dict):
             val = resp.get("status")
             if isinstance(val, str):
@@ -846,15 +1240,6 @@ def main():
         if isinstance(resp, str):
             return resp.lower()
         return ""
-
-    def _status_message(resp: Any) -> str:
-        if isinstance(resp, ExecutionResult):
-            msg = resp.message or resp.status
-            return str(msg) if msg is not None else ""
-        if isinstance(resp, dict):
-            msg = resp.get("message") or resp.get("status")
-            return str(msg) if msg is not None else ""
-        return str(resp)
 
     def _parse_price_change(pc: Dict[str, Any]) -> Tuple[float, float, float]:
         def _to_float(val: Any) -> Optional[float]:
@@ -964,12 +1349,19 @@ def main():
             now = time.time()
             remaining = market_deadline_ts - now
             if remaining <= 0:
+                if not countdown_phase_event.is_set():
+                    countdown_phase_event.set()
                 if last_display != 0:
                     print("[COUNTDOWN] 距离市场结束还剩 00:00")
                 print("[COUNTDOWN] 倒计时结束，开始确认市场状态…")
                 _confirm_market_closed()
                 return
-            if remaining <= 300:
+            if remaining <= countdown_display_seconds:
+                if not countdown_phase_event.is_set():
+                    countdown_phase_event.set()
+                    print(
+                        f"[COUNTDOWN] 已进入倒计时提醒阶段（≤ {countdown_minutes:.2f} 分钟）。"
+                    )
                 secs_left = int(remaining)
                 if secs_left != last_display:
                     mm = secs_left // 60
@@ -983,10 +1375,11 @@ def main():
                         return
                     time.sleep(0.2)
             else:
-                wait = min(remaining - 300, 60)
+                wait = min(remaining - countdown_display_seconds, 60)
                 if wait <= 0:
                     wait = 1
-                for _ in range(int(wait)):
+                sleep_steps = max(int(wait), 1)
+                for _ in range(sleep_steps):
                     if stop_event.is_set():
                         return
                     time.sleep(1)
@@ -998,6 +1391,7 @@ def main():
             "label": f"{title} ({side})",
             "on_event": _on_event,
             "verbose": False,
+            "stop_event": stop_event,
         },
         daemon=True,
     )
@@ -1033,20 +1427,43 @@ def main():
 
     threading.Thread(target=_input_listener, daemon=True).start()
 
-    success_status = {"success", "matched", "filled", "complete", "completed", "partial", "executed"}
+    success_status = {
+        "success",
+        "matched",
+        "filled",
+        "complete",
+        "completed",
+    }
     position_size: Optional[float] = None
     last_order_size: Optional[float] = None
+    pending_sell_fill_price: Optional[float] = None
     last_log = 0.0
     buy_cooldown_until: float = 0.0
-    pending_buy: Optional[Action] = None
+    last_buy_cooldown_log: float = 0.0
+
+    def _complete_sell(avg_price: float, detail: str = ""):
+        nonlocal position_size, last_order_size, pending_sell_fill_price
+        nonlocal buy_cooldown_until, last_buy_cooldown_log
+        strategy.on_sell_filled(avg_price=avg_price)
+        position_size = None
+        last_order_size = None
+        pending_sell_fill_price = None
+        buy_cooldown_until = time.time() + 15.0
+        last_buy_cooldown_log = 0.0
+        msg = f"[STATE] 卖出成交 -> price={avg_price:.4f}"
+        if detail:
+            msg = f"{msg} {detail}"
+        print(msg)
+        if countdown_phase_event.is_set():
+            print(
+                "[COUNTDOWN] 倒计时阶段内卖出成交，程序将提前结束以避免重新买入。"
+            )
+            strategy.stop("countdown sell exit")
+            stop_event.set()
 
     try:
         while not stop_event.is_set():
             now = time.time()
-            if pending_buy is not None and now >= buy_cooldown_until:
-                print("[COOLDOWN] 卖出冷却结束，重新尝试买入…")
-                action_queue.put(pending_buy)
-                pending_buy = None
 
             if now - last_log >= 1.0:
                 snap = latest.get(token_id) or {}
@@ -1063,19 +1480,27 @@ def main():
                 )
 
                 extra_lines = []
-                if st.get("state") == "FLAT":
-                    buy_target = (st.get("config") or {}).get("buy_price_threshold")
-                    if buy_target is not None:
-                        extra_lines.append(f"    目标买入价格: {float(buy_target):.4f}")
-                    else:
-                        extra_lines.append("    目标买入价格: -")
-
                 if st.get("state") == "LONG":
                     sell_target = st.get("sell_trigger")
                     if sell_target is not None:
                         extra_lines.append(f"    目标卖出价格: {float(sell_target):.4f}")
                     else:
                         extra_lines.append("    目标卖出价格: -")
+
+                drop_stats = st.get("drop_stats") or {}
+                current_drop_ratio = drop_stats.get("current_drop_ratio")
+                if isinstance(current_drop_ratio, (int, float)):
+                    details = []
+                    window_high = drop_stats.get("window_high")
+                    if isinstance(window_high, (int, float)):
+                        details.append(f"高点{float(window_high):.4f}")
+                    window_low = drop_stats.get("window_low")
+                    if isinstance(window_low, (int, float)):
+                        details.append(f"低点{float(window_low):.4f}")
+                    line = f"    当前实时跌幅: {current_drop_ratio * 100:.2f}%"
+                    if details:
+                        line += " (" + " / ".join(details) + ")"
+                    extra_lines.append(line)
 
                 for line in extra_lines:
                     print(line)
@@ -1108,10 +1533,21 @@ def main():
                 now_for_buy = time.time()
                 if now_for_buy < buy_cooldown_until:
                     remaining = buy_cooldown_until - now_for_buy
+                    if now_for_buy - last_buy_cooldown_log >= 5.0:
+                        print(
+                            f"[COOLDOWN] 冷却期内暂停买入，剩余 {max(0.0, remaining):.1f}s 后再尝试。"
+                        )
+                        last_buy_cooldown_log = now_for_buy
+                    strategy.on_reject("buy cooldown active")
+                    continue
+
+                realtime_price = ask if ask > 0 else float(snap.get("price") or 0.0)
+                if realtime_price < min_realtime_price:
                     print(
-                        f"[COOLDOWN] 最近一次卖出后尚在冷却中，剩余 {remaining:.1f}s 再尝试买入。"
+                        "[SKIP] 实时价格 "
+                        f"{realtime_price:.4f} 低于买入下限 {min_realtime_price:.4f}，跳过本次买入信号。"
                     )
-                    pending_buy = action
+                    strategy.on_reject("realtime price below min threshold")
                     continue
 
                 ref_price = action.ref_price or ask or float(snap.get("price") or 0.0)
@@ -1127,12 +1563,21 @@ def main():
                     order_size = _calc_size_by_1dollar(ref_price)
                     print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
 
+                market_min_order = _coerce_positive_float(
+                    (market_meta or {}).get("minimum_order_size")
+                )
+                market_tick_size = _coerce_positive_float(
+                    (market_meta or {}).get("minimum_tick_size")
+                )
+
                 try:
-                    resp = execute_auto_buy(
+                    resp = _place_buy(
                         client=client,
                         token_id=token_id,
                         price=ref_price,
                         size=order_size,
+                        min_order_size=market_min_order or 0.0,
+                        tick_size=market_tick_size or 0.0,
                     )
                 except Exception as exc:
                     print(f"[ERR] 买入下单异常：{exc}")
@@ -1140,21 +1585,29 @@ def main():
                     continue
                 print(f"[TRADE][BUY] resp={resp}")
                 status = _status_lower(resp)
+                fill_px = _extract_price(resp, ref_price)
+                fill_size = _extract_size(resp, order_size)
+                filled_positive = fill_size is not None and float(fill_size) > 0
+                if status not in success_status and filled_positive:
+                    status = "filled"
                 if status in success_status:
-                    fill_px = _extract_price(resp, ref_price)
-                    fill_size = _extract_size(resp, order_size)
                     try:
                         position_size = float(fill_size)
                         last_order_size = float(fill_size)
                     except Exception:
                         position_size = float(order_size)
                         last_order_size = float(order_size)
+                    pending_sell_fill_price = None
                     strategy.on_buy_filled(avg_price=fill_px, size=position_size)
                     print(
                         f"[STATE] 买入成交 -> price={fill_px:.4f} size={position_size:.4f}"
                     )
                 else:
-                    reason = _status_message(resp)
+                    reason = (
+                        resp.message
+                        if isinstance(resp, ExecutionResult) and resp.message
+                        else (resp.get("message") if isinstance(resp, dict) else str(resp))
+                    )
                     print(f"[WARN] 买入未成交：{reason}")
                     strategy.on_reject(reason if isinstance(reason, str) else None)
 
@@ -1176,27 +1629,147 @@ def main():
                     continue
 
                 try:
-                    resp = execute_auto_sell(
+                    resp = _place_sell(
                         client=client,
                         token_id=token_id,
                         price=ref_price,
                         size=sell_size,
                     )
                 except Exception as exc:
-                    print(f"[ERR] 卖出下单异常：{exc}")
-                    strategy.on_reject(str(exc))
+                    err_text = str(exc)
+                    print(f"[ERR] 卖出下单异常：{err_text}")
+                    if _is_balance_exhausted_error(err_text):
+                        assumed_price = pending_sell_fill_price
+                        if assumed_price is None:
+                            try:
+                                assumed_price = float(ref_price)
+                            except Exception:
+                                assumed_price = 0.0
+                        print(
+                            "[INFO] 卖出被拒绝且提示余额不足，视作仓位已清空，跳过后续卖出重试。"
+                        )
+                        _complete_sell(float(assumed_price or 0.0), "(余额不足提示)")
+                        continue
+                    strategy.on_reject(err_text)
                     continue
                 print(f"[TRADE][SELL] resp={resp}")
                 status = _status_lower(resp)
-                if status in success_status:
-                    fill_px = _extract_price(resp, ref_price)
-                    strategy.on_sell_filled(avg_price=fill_px)
-                    position_size = None
-                    last_order_size = None
-                    buy_cooldown_until = time.time() + 15.0
-                    print(f"[STATE] 卖出成交 -> price={fill_px:.4f}")
+                fill_px = _extract_price(resp, ref_price)
+                filled_size = _extract_size(resp, 0.0)
+                try:
+                    sell_size_f = float(sell_size)
+                except (TypeError, ValueError):
+                    sell_size_f = 0.0
+                remaining_size = _extract_remaining(resp, sell_size_f)
+
+                fully_filled = False
+                if isinstance(resp, ExecutionResult):
+                    fully_filled = resp.remaining <= 1e-9
+                elif remaining_size is not None:
+                    fully_filled = remaining_size <= 1e-9 and status in success_status
+                elif status in success_status and sell_size_f > 0 and filled_size >= sell_size_f - 1e-6:
+                    fully_filled = True
+
+                if fully_filled:
+                    try:
+                        close_price = float(
+                            fill_px if fill_px is not None else float(ref_price)
+                        )
+                    except Exception:
+                        close_price = float(ref_price or 0.0)
+                    pending_sell_fill_price = close_price
+                    remote_size, remote_ok, remote_info = _get_remote_position_size(
+                        client, token_id
+                    )
+                    if not remote_ok:
+                        print(
+                            f"[WARN] 卖出后仓位核实失败：{remote_info}，将按成交结果假定已清仓。"
+                        )
+                        _complete_sell(close_price, "(仓位核实失败，按成交结果处理)")
+                        continue
+                    if remote_size is not None and remote_size > 1e-6:
+                        print(
+                            f"[WARN] 卖出成交但账户仍有剩余 {remote_size:.4f}，继续等待清仓。"
+                        )
+                        position_size = remote_size
+                        last_order_size = position_size
+                        pending_sell_fill_price = close_price
+                        strategy.on_reject(
+                            f"position remaining {remote_size:.4f} after sell ({remote_info})"
+                        )
+                        continue
+
+                    _complete_sell(close_price)
+                    continue
+                elif filled_size > 1e-9:
+                    try:
+                        close_price = float(
+                            fill_px if fill_px is not None else float(ref_price)
+                        )
+                    except Exception:
+                        close_price = float(ref_price or 0.0)
+                    remaining_effective = remaining_size
+                    if remaining_effective is None:
+                        remaining_effective = max(sell_size_f - float(filled_size), 0.0)
+                    try:
+                        remaining_effective = float(remaining_effective)
+                    except Exception:
+                        remaining_effective = 0.0
+                    if remaining_effective <= 1e-6:
+                        remaining_effective = 0.0
+
+                    remote_size, remote_ok, remote_info = _get_remote_position_size(
+                        client, token_id
+                    )
+                    if remote_ok and remote_size is not None:
+                        if remote_size <= 1e-6:
+                            _complete_sell(close_price, "(partial 状态但账户已清仓)")
+                            continue
+                        if abs(remote_size - remaining_effective) > 1e-6:
+                            print(
+                                f"[INFO] 本地剩余 {remaining_effective:.4f} 与账户仓位 "
+                                f"{remote_size:.4f} 不一致，改以账户仓位为准。"
+                            )
+                            remaining_effective = remote_size
+                        pending_sell_fill_price = close_price
+                    elif not remote_ok:
+                        print(
+                            f"[WARN] 部分成交后仓位核实失败：{remote_info}，保留当前估算。"
+                        )
+                        pending_sell_fill_price = close_price
+
+                    if remaining_effective <= 0:
+                        _complete_sell(close_price, "(partial 状态但剩余≈0)")
+                        continue
+
+                    position_size = remaining_effective if remaining_effective > 0 else None
+                    last_order_size = position_size
+                    pending_sell_fill_price = close_price
+
+                    reason = (
+                        resp.message
+                        if isinstance(resp, ExecutionResult) and resp.message
+                        else (resp.get("message") if isinstance(resp, dict) else str(resp))
+                    )
+                    detail = (
+                        f"partial fill, remaining {remaining_effective:.4f}"
+                        if remaining_effective > 0
+                        else "partial fill"
+                    )
+                    if reason and reason != detail:
+                        detail = f"{detail} ({reason})"
+
+                    print(
+                        f"[WARN] 卖出部分成交 -> filled={float(filled_size):.4f} "
+                        f"remaining={remaining_effective:.4f}"
+                    )
+                    strategy.on_reject(detail)
                 else:
-                    reason = _status_message(resp)
+                    reason = (
+                        resp.message
+                        if isinstance(resp, ExecutionResult) and resp.message
+                        else (resp.get("message") if isinstance(resp, dict) else str(resp))
+                    )
                     print(f"[WARN] 卖出未成交：{reason}")
                     strategy.on_reject(reason if isinstance(reason, str) else None)
 
@@ -1209,13 +1782,7 @@ def main():
         stop_event.set()
         final_status = strategy.status()
         print(f"[EXIT] 最终状态: {final_status}")
-        try:
-            if _should_attempt_claim(market_meta, final_status, market_closed_detected):
-                _attempt_claim(client, market_meta, token_id)
-            else:
-                print("[CLAIM] 未检测到需要 claim 的仓位，脚本结束。")
-        except Exception as claim_exc:
-            print(f"[CLAIM] 自动 claim 过程出现异常: {claim_exc}")
+        print("[INFO] 自动 claim 功能已移除，如有需要请手动在官网完成结算。")
 
 
 if __name__ == "__main__":
