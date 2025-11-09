@@ -292,7 +292,7 @@ def _describe_auth_context() -> None:
 def _coerce_float(value: Any) -> Optional[float]:
     if value is None:
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     if isinstance(value, str):
         raw = value.strip()
@@ -727,123 +727,34 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
     return outcomes
 
 
-def _apply_price_fallbacks_from_market(
-    market: Dict[str, Any], outcomes: Dict[str, OutcomeSnapshot]
-) -> None:
-    """补齐 outcome 报价信息，使 CLI 默认筛选条件与 poly_filter 保持一致。"""
-
-    yes = outcomes.get("yes")
-    no = outcomes.get("no")
-
-    # 1) outcomePrices —— gamma-api 中广泛存在的列表，poly_filter 即依赖此字段。
-    prices = _ensure_sequence(market.get("outcomePrices"))
-    if yes and yes.best_ask is None and len(prices) >= 1:
-        yes.best_ask = _coerce_float(prices[0])
-    if no and no.best_ask is None and len(prices) >= 2:
-        no.best_ask = _coerce_float(prices[1])
-
-    # 2) bestBids / bestAsks —— 新接口在市场级别提供的数组。
-    bids = _ensure_sequence(market.get("bestBids"))
-    asks = _ensure_sequence(market.get("bestAsks"))
-    if yes and yes.best_bid is None and len(bids) >= 1:
-        yes.best_bid = _coerce_float(bids[0])
-    if no and no.best_bid is None and len(bids) >= 2:
-        no.best_bid = _coerce_float(bids[1])
-    if yes and yes.best_ask is None and len(asks) >= 1:
-        yes.best_ask = _coerce_float(asks[0])
-    if no and no.best_ask is None and len(asks) >= 2:
-        no.best_ask = _coerce_float(asks[1])
-
-    # 3) 单值 bestBid / bestAsk 字段，通常代表 YES outcome。
-    if yes:
-        if yes.best_bid is None:
-            yes.best_bid = _coerce_float(market.get("bestBid") or market.get("best_bid"))
-        if yes.best_ask is None:
-            yes.best_ask = _coerce_float(market.get("bestAsk") or market.get("best_ask"))
-
-    # 4) 若仍然缺失，则退化到 last_price 作为至少一个方向的报价。
-    for outcome in (yes, no):
-        if not outcome:
-            continue
-        if outcome.best_bid is None and outcome.last_price is not None:
-            outcome.best_bid = outcome.last_price
-        if outcome.best_ask is None and outcome.last_price is not None:
-            outcome.best_ask = outcome.last_price
-
-
-def _extract_best_prices(orderbook: Any) -> Tuple[Optional[float], Optional[float]]:
-    if not isinstance(orderbook, MappingABC):
-        return None, None
-
-    payload: Any = orderbook
-    if isinstance(payload.get("data"), MappingABC):
-        payload = payload.get("data")
-    if not isinstance(payload, MappingABC):
-        return None, None
-
-    def _first_price(levels: Any) -> Optional[float]:
-        if isinstance(levels, MappingABC):
-            levels = levels.get("levels")
-        if not isinstance(levels, IterableABC) or isinstance(levels, (str, bytes, bytearray)):
-            return _coerce_float(levels)
-        for level in levels:
-            if isinstance(level, MappingABC):
-                price = _coerce_float(level.get("price"))
-            else:
-                price = _coerce_float(level)
-            if price is not None:
-                return price
-        return None
-
-    return _first_price(payload.get("bids")), _first_price(payload.get("asks"))
-
-
-def _extract_best_side(payload: Any, *, side: str) -> Optional[float]:
+def _extract_best_ask(payload: Any) -> Optional[float]:
     numeric = _coerce_float(payload)
     if numeric is not None:
         return numeric
 
     if isinstance(payload, MappingABC):
-        if side == "ask":
-            primary_keys = (
-                "best_ask",
-                "bestAsk",
-                "ask",
-                "offer",
-                "best_offer",
-                "bestOffer",
-                "lowest_ask",
-                "lowestAsk",
-                "sell",
-            )
-            ladder_keys = (
-                "asks",
-                "ask_levels",
-                "sell_orders",
-                "sellOrders",
-                "offers",
-            )
-        else:
-            primary_keys = (
-                "best_bid",
-                "bestBid",
-                "bid",
-                "best_buy",
-                "bestBuy",
-                "highest_bid",
-                "highestBid",
-                "buy",
-            )
-            ladder_keys = (
-                "bids",
-                "bid_levels",
-                "buy_orders",
-                "buyOrders",
-            )
+        primary_keys = (
+            "best_ask",
+            "bestAsk",
+            "ask",
+            "offer",
+            "best_offer",
+            "bestOffer",
+            "lowest_ask",
+            "lowestAsk",
+            "sell",
+        )
+        ladder_keys = (
+            "asks",
+            "ask_levels",
+            "sell_orders",
+            "sellOrders",
+            "offers",
+        )
 
         for key in primary_keys:
             if key in payload:
-                extracted = _extract_best_side(payload[key], side=side)
+                extracted = _extract_best_ask(payload[key])
                 if extracted is not None:
                     return extracted
 
@@ -856,19 +767,77 @@ def _extract_best_side(payload: Any, *, side: str) -> Optional[float]:
                             candidate = _coerce_float(entry["price"])
                             if candidate is not None:
                                 return candidate
-                        extracted = _extract_best_side(entry, side=side)
+                        extracted = _extract_best_ask(entry)
                         if extracted is not None:
                             return extracted
 
         for value in payload.values():
-            extracted = _extract_best_side(value, side=side)
+            extracted = _extract_best_ask(value)
             if extracted is not None:
                 return extracted
         return None
 
     if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
-            extracted = _extract_best_side(item, side=side)
+            extracted = _extract_best_ask(item)
+            if extracted is not None:
+                return extracted
+        return None
+
+    return None
+
+
+def _extract_best_bid(payload: Any) -> Optional[float]:
+    numeric = _coerce_float(payload)
+    if numeric is not None:
+        return numeric
+
+    if isinstance(payload, MappingABC):
+        primary_keys = (
+            "best_bid",
+            "bestBid",
+            "bid",
+            "best_buy",
+            "bestBuy",
+            "highest_bid",
+            "highestBid",
+            "buy",
+        )
+        ladder_keys = (
+            "bids",
+            "bid_levels",
+            "buy_orders",
+            "buyOrders",
+        )
+
+        for key in primary_keys:
+            if key in payload:
+                extracted = _extract_best_bid(payload[key])
+                if extracted is not None:
+                    return extracted
+
+        for key in ladder_keys:
+            if key in payload:
+                ladder = payload[key]
+                if isinstance(ladder, IterableABC) and not isinstance(ladder, (str, bytes, bytearray)):
+                    for entry in ladder:
+                        if isinstance(entry, MappingABC) and "price" in entry:
+                            candidate = _coerce_float(entry["price"])
+                            if candidate is not None:
+                                return candidate
+                        extracted = _extract_best_bid(entry)
+                        if extracted is not None:
+                            return extracted
+
+        for value in payload.values():
+            extracted = _extract_best_bid(value)
+            if extracted is not None:
+                return extracted
+        return None
+
+    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            extracted = _extract_best_bid(item)
             if extracted is not None:
                 return extracted
         return None
@@ -880,6 +849,7 @@ def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Opt
     method_candidates = (
         ("get_market_orderbook", {"market": token_id}),
         ("get_market_orderbook", {"token_id": token_id}),
+        ("get_market_orderbook", {"market_id": token_id}),
         ("get_order_book", {"market": token_id}),
         ("get_order_book", {"token_id": token_id}),
         ("get_orderbook", {"market": token_id}),
@@ -906,18 +876,13 @@ def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Opt
         payload: Any = resp
         if isinstance(resp, tuple) and len(resp) == 2:
             payload = resp[1]
-        if isinstance(payload, MappingABC) and isinstance(payload.get("data"), MappingABC):
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
             payload = payload.get("data")
 
-        bid = _extract_best_side(payload, side="bid")
-        ask = _extract_best_side(payload, side="ask")
+        bid = _extract_best_bid(payload)
+        ask = _extract_best_ask(payload)
         if bid is not None or ask is not None:
             return bid, ask
-
-        if isinstance(payload, MappingABC):
-            bid, ask = _extract_best_prices(payload)
-            if bid is not None or ask is not None:
-                return bid, ask
 
     return None, None
 
