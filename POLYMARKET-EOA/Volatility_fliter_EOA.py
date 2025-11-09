@@ -643,6 +643,24 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
         token_id = outcome.get("tokenId") or outcome.get("clobTokenId") or outcome.get("clob_token_id")
         if token_id is not None:
             token_id = str(token_id)
+        best_bid = _coerce_float(
+            outcome.get("bestBid")
+            or outcome.get("best_bid")
+            or outcome.get("bid")
+            or outcome.get("highestBid")
+            or outcome.get("highest_bid")
+            or outcome.get("bestBuy")
+            or outcome.get("buy")
+        )
+        best_ask = _coerce_float(
+            outcome.get("bestAsk")
+            or outcome.get("best_ask")
+            or outcome.get("ask")
+            or outcome.get("lowestAsk")
+            or outcome.get("lowest_ask")
+            or outcome.get("bestSell")
+            or outcome.get("sell")
+        )
         last_price = _coerce_float(
             outcome.get("lastPrice")
             or outcome.get("price")
@@ -659,6 +677,8 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
         outcomes[side] = OutcomeSnapshot(
             side=side,
             token_id=token_id,
+            best_bid=best_bid,
+            best_ask=best_ask,
             last_price=last_price,
             volume_24h=vol24,
             total_volume=total_vol,
@@ -666,6 +686,8 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
         )
     if {"yes", "no"} <= outcomes.keys():
         return outcomes
+
+    _apply_price_fallbacks_from_market(market, outcomes)
 
     # Fallback：根据 clobTokenIds 补齐 token 信息
     token_ids = market.get("clobTokenIds") or market.get("clobTokens")
@@ -689,6 +711,63 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
             outcomes["no"] = OutcomeSnapshot(side="no", token_id=str(no_id))
 
     return outcomes
+
+
+def _apply_price_fallbacks_from_market(
+    market: Dict[str, Any], outcomes: Dict[str, OutcomeSnapshot]
+) -> None:
+    """补齐 outcome 报价信息，使 CLI 默认筛选条件与 poly_filter 保持一致。"""
+
+    def _ensure_sequence(raw: Any) -> Tuple[Any, ...]:
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return tuple()
+            if isinstance(parsed, (list, tuple)):
+                return tuple(parsed)
+            return tuple()
+        if isinstance(raw, (list, tuple)):
+            return tuple(raw)
+        return tuple()
+
+    yes = outcomes.get("yes")
+    no = outcomes.get("no")
+
+    # 1) outcomePrices —— gamma-api 中广泛存在的列表，poly_filter 即依赖此字段。
+    prices = _ensure_sequence(market.get("outcomePrices"))
+    if yes and yes.best_ask is None and len(prices) >= 1:
+        yes.best_ask = _coerce_float(prices[0])
+    if no and no.best_ask is None and len(prices) >= 2:
+        no.best_ask = _coerce_float(prices[1])
+
+    # 2) bestBids / bestAsks —— 新接口在市场级别提供的数组。
+    bids = _ensure_sequence(market.get("bestBids"))
+    asks = _ensure_sequence(market.get("bestAsks"))
+    if yes and yes.best_bid is None and len(bids) >= 1:
+        yes.best_bid = _coerce_float(bids[0])
+    if no and no.best_bid is None and len(bids) >= 2:
+        no.best_bid = _coerce_float(bids[1])
+    if yes and yes.best_ask is None and len(asks) >= 1:
+        yes.best_ask = _coerce_float(asks[0])
+    if no and no.best_ask is None and len(asks) >= 2:
+        no.best_ask = _coerce_float(asks[1])
+
+    # 3) 单值 bestBid / bestAsk 字段，通常代表 YES outcome。
+    if yes:
+        if yes.best_bid is None:
+            yes.best_bid = _coerce_float(market.get("bestBid") or market.get("best_bid"))
+        if yes.best_ask is None:
+            yes.best_ask = _coerce_float(market.get("bestAsk") or market.get("best_ask"))
+
+    # 4) 若仍然缺失，则退化到 last_price 作为至少一个方向的报价。
+    for outcome in (yes, no):
+        if not outcome:
+            continue
+        if outcome.best_bid is None and outcome.last_price is not None:
+            outcome.best_bid = outcome.last_price
+        if outcome.best_ask is None and outcome.last_price is not None:
+            outcome.best_ask = outcome.last_price
 
 
 def _extract_best_prices(orderbook: Any) -> Tuple[Optional[float], Optional[float]]:
