@@ -1,8 +1,4 @@
-# Volatility_sell_EOA.py
-# -*- coding: utf-8 -*-
-"""
-EOA 版批量卖单执行器，沿用 Safe 版本的拆单与重试逻辑，返回 ExecutionResult。
-"""
+"""EOA 版批量卖单执行器，沿用 Safe 版本拆单与重试逻辑，返回 ExecutionResult。"""
 
 import math
 from functools import lru_cache
@@ -54,7 +50,11 @@ def execute_auto_sell(
         )
 
     engine = _build_engine(client)
-    result = engine.execute_sell(token_id=str(token_id), price=float(price), quantity=float(size_real))
+    result = engine.execute_sell(
+        token_id=str(token_id),
+        price=float(price),
+        quantity=float(size_real),
+    )
     print(
         "[Volatility_sell_EOA] 执行结果 -> "
         f"status={result.status} filled={result.filled} requested={result.requested} "
