@@ -272,7 +272,7 @@ def _describe_auth_context() -> None:
 def _coerce_float(value: Any) -> Optional[float]:
     if value is None:
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     if isinstance(value, str):
         raw = value.strip()
@@ -671,147 +671,145 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
     return outcomes
 
 
-def _extract_best_prices(orderbook: Any) -> Tuple[Optional[float], Optional[float]]:
-    if not isinstance(orderbook, MappingABC):
-        raise TypeError("订单簿响应格式错误：缺少映射结构")
-
-    payload = orderbook
-    if "data" in payload and isinstance(payload.get("data"), MappingABC):
-        payload = payload["data"]
-
-    if not isinstance(payload, MappingABC):
-        raise TypeError("订单簿响应格式错误：data 字段不是映射")
-
-    if "bids" not in payload or "asks" not in payload:
-        missing = {key for key in ("bids", "asks") if key not in payload}
-        raise KeyError(f"订单簿缺少必要字段：{', '.join(sorted(missing))}")
-
-    def _first_price(levels: Any) -> Optional[float]:
-        if isinstance(levels, MappingABC):
-            levels = levels.get("levels")
-        if not isinstance(levels, IterableABC) or isinstance(levels, (str, bytes, bytearray)):
-            raise TypeError("订单簿价格梯度格式错误")
-        for level in levels:
-            if isinstance(level, MappingABC):
-                price = _coerce_float(level.get("price"))
-            else:
-                price = _coerce_float(level)
-            if price is not None:
-                return price
-        return None
-
-    return _first_price(payload["bids"]), _first_price(payload["asks"])
-
-
-def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Optional[float]]:
-    orderbook = client.get_market_orderbook(market=token_id)
-
-    if isinstance(orderbook, tuple) and len(orderbook) == 2:
-        orderbook = orderbook[1]
-
-    bid, ask = _extract_best_prices(orderbook)
-    return bid, ask
-
-
-def _extract_best_quote(payload: Any, *, side: str) -> Optional[float]:
+def _extract_best_ask(payload: Any) -> Optional[float]:
     numeric = _coerce_float(payload)
     if numeric is not None:
         return numeric
 
     if isinstance(payload, MappingABC):
-        if side == "ask":
-            primary_keys = (
-                "best_ask",
-                "bestAsk",
-                "ask",
-                "offer",
-                "best_offer",
-                "bestOffer",
-                "lowest_ask",
-                "lowestAsk",
-                "sell",
-            )
-            ladder_keys = (
-                "asks",
-                "ask_levels",
-                "sell_orders",
-                "sellOrders",
-                "offers",
-            )
-        else:
-            primary_keys = (
-                "best_bid",
-                "bestBid",
-                "bid",
-                "highest_bid",
-                "highestBid",
-                "buy",
-            )
-            ladder_keys = (
-                "bids",
-                "bid_levels",
-                "buy_orders",
-                "buyOrders",
-                "orders",
-            )
+        primary_keys = (
+            "best_ask",
+            "bestAsk",
+            "ask",
+            "offer",
+            "best_offer",
+            "bestOffer",
+            "lowest_ask",
+            "lowestAsk",
+            "sell",
+        )
+        ladder_keys = (
+            "asks",
+            "ask_levels",
+            "sell_orders",
+            "sellOrders",
+            "offers",
+        )
 
         for key in primary_keys:
             if key in payload:
-                extracted = _extract_best_quote(payload[key], side=side)
+                extracted = _extract_best_ask(payload[key])
                 if extracted is not None:
                     return extracted
 
         for key in ladder_keys:
-            if key not in payload:
-                continue
-            ladder = payload[key]
-            if isinstance(ladder, IterableABC) and not isinstance(
-                ladder, (str, bytes, bytearray)
-            ):
-                for entry in ladder:
-                    if isinstance(entry, MappingABC):
-                        candidate = _coerce_float(
-                            entry.get("price")
-                            or entry.get("limitPrice")
-                            or entry.get("limit_price")
-                            or entry.get("p")
-                        )
-                        if candidate is not None:
-                            return candidate
-                        extracted = _extract_best_quote(entry, side=side)
+            if key in payload:
+                ladder = payload[key]
+                if isinstance(ladder, IterableABC) and not isinstance(ladder, (str, bytes, bytearray)):
+                    for entry in ladder:
+                        if isinstance(entry, MappingABC) and "price" in entry:
+                            candidate = _coerce_float(entry["price"])
+                            if candidate is not None:
+                                return candidate
+                        extracted = _extract_best_ask(entry)
                         if extracted is not None:
                             return extracted
-                    elif isinstance(entry, IterableABC) and not isinstance(
-                        entry, (str, bytes, bytearray)
-                    ):
-                        for item in entry:
-                            extracted = _extract_best_quote(item, side=side)
-                            if extracted is not None:
-                                return extracted
 
         for value in payload.values():
-            extracted = _extract_best_quote(value, side=side)
+            extracted = _extract_best_ask(value)
             if extracted is not None:
                 return extracted
         return None
 
     if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
-            extracted = _extract_best_quote(item, side=side)
+            extracted = _extract_best_ask(item)
             if extracted is not None:
                 return extracted
+        return None
+
+    return None
+
+
+def _extract_best_bid(payload: Any) -> Optional[float]:
+    numeric = _coerce_float(payload)
+    if numeric is not None:
+        return numeric
+
+    if isinstance(payload, MappingABC):
+        primary_keys = (
+            "best_bid",
+            "bestBid",
+            "bid",
+            "best_buy",
+            "bestBuy",
+            "highest_bid",
+            "highestBid",
+            "buy",
+        )
+        ladder_keys = (
+            "bids",
+            "bid_levels",
+            "buy_orders",
+            "buyOrders",
+        )
+
+        for key in primary_keys:
+            if key in payload:
+                extracted = _extract_best_bid(payload[key])
+                if extracted is not None:
+                    return extracted
+
+        for key in ladder_keys:
+            if key in payload:
+                ladder = payload[key]
+                if isinstance(ladder, IterableABC) and not isinstance(ladder, (str, bytes, bytearray)):
+                    for entry in ladder:
+                        if isinstance(entry, MappingABC) and "price" in entry:
+                            candidate = _coerce_float(entry["price"])
+                            if candidate is not None:
+                                return candidate
+                        extracted = _extract_best_bid(entry)
+                        if extracted is not None:
+                            return extracted
+
+        for value in payload.values():
+            extracted = _extract_best_bid(value)
+            if extracted is not None:
+                return extracted
+        return None
+
+    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            extracted = _extract_best_bid(item)
+            if extracted is not None:
+                return extracted
+        return None
 
     return None
 
 
 def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Optional[float]]:
-    for name, arg_keys in _ORDERBOOK_METHOD_CANDIDATES:
+    method_candidates = (
+        ("get_market_orderbook", {"market": token_id}),
+        ("get_market_orderbook", {"token_id": token_id}),
+        ("get_market_orderbook", {"market_id": token_id}),
+        ("get_order_book", {"market": token_id}),
+        ("get_order_book", {"token_id": token_id}),
+        ("get_orderbook", {"market": token_id}),
+        ("get_orderbook", {"token_id": token_id}),
+        ("get_market", {"market": token_id}),
+        ("get_market", {"token_id": token_id}),
+        ("get_market_data", {"market": token_id}),
+        ("get_market_data", {"token_id": token_id}),
+        ("get_ticker", {"market": token_id}),
+        ("get_ticker", {"token_id": token_id}),
+    )
+
+    for name, kwargs in method_candidates:
         fn = getattr(client, name, None)
         if not callable(fn):
             continue
-
-        kwargs = {key: token_id for key in arg_keys}
-
         try:
             resp = fn(**kwargs)
         except TypeError:
@@ -819,20 +817,14 @@ def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Opt
         except Exception:
             continue
 
-        payload = resp
+        payload: Any = resp
         if isinstance(resp, tuple) and len(resp) == 2:
             payload = resp[1]
-
         if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
             payload = payload.get("data")
 
-        if isinstance(payload, MappingABC):
-            bid, ask = _extract_best_prices(payload)
-            if bid is not None or ask is not None:
-                return bid, ask
-
-        bid = _extract_best_quote(payload, side="bid")
-        ask = _extract_best_quote(payload, side="ask")
+        bid = _extract_best_bid(payload)
+        ask = _extract_best_ask(payload)
         if bid is not None or ask is not None:
             return bid, ask
 
@@ -1087,17 +1079,162 @@ def market_passes(snapshot: MarketSnapshot, cfg: MarketFilterConfig) -> bool:
     return passed
 
 
+def _format_trace_bool(value: Optional[bool]) -> str:
+    if value is None:
+        return "-"
+    return "是" if value else "否"
+
+
+def _format_trace_numeric(value: Any) -> str:
+    numeric = _coerce_float(value)
+    if numeric is None:
+        if value is None:
+            return "-"
+        return str(value)
+    if abs(numeric) >= 1000:
+        return f"{numeric:,.2f}"
+    return f"{numeric:.4f}"
+
+
+def _format_trace_sequence_display(raw: Any, *, limit: int = 4, numeric: bool = False) -> str:
+    if numeric:
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                seq: Tuple[Any, ...] = tuple()
+            else:
+                seq = tuple(parsed) if isinstance(parsed, (list, tuple)) else tuple()
+        elif isinstance(raw, (list, tuple)):
+            seq = tuple(raw)
+        elif raw is None:
+            seq = tuple()
+        else:
+            seq = (raw,)
+    elif isinstance(raw, (list, tuple)):
+        seq = tuple(raw)
+    else:
+        if raw is None:
+            return "-"
+        if isinstance(raw, str):
+            text = raw.strip()
+            if len(text) > 80:
+                text = text[:77] + "..."
+            return text or "-"
+        return str(raw)
+    if not seq:
+        return "[]"
+    parts: List[str] = []
+    for idx, item in enumerate(seq):
+        if idx >= limit:
+            parts.append("...")
+            break
+        if numeric:
+            parts.append(_format_trace_numeric(item))
+        else:
+            parts.append(str(item))
+    return "[" + ", ".join(parts) + "]"
+
+
+def _format_trace_raw_market(index: int, total: int, market: Dict[str, Any]) -> str:
+    slug = str(
+        market.get("slug")
+        or market.get("marketSlug")
+        or market.get("market_slug")
+        or ""
+    )
+    title = str(
+        market.get("question")
+        or market.get("title")
+        or market.get("name")
+        or slug
+        or "(no-title)"
+    )
+    status_line = (
+        f"[TRACE] [{index}/{total}] 原始市场：slug={slug or '-'} | 标题={title}\n"
+        f"[TRACE]   状态：active={_format_trace_bool(_coerce_bool(market.get('active')))} "
+        f"resolved={_format_trace_bool(_coerce_bool(market.get('resolved')))} "
+        f"closed={_format_trace_bool(_coerce_bool(market.get('closed')))} "
+        f"acceptingOrders={_format_trace_bool(_coerce_bool(market.get('acceptingOrders')))}"
+    )
+
+    liquidity_candidates = (
+        market.get("liquidity"),
+        market.get("liquidity_num"),
+        market.get("liquidityNum"),
+        market.get("totalLiquidity"),
+        market.get("liquidityUsd"),
+        market.get("total_liquidity"),
+    )
+    liquidity = next((val for val in liquidity_candidates if val is not None), None)
+
+    vol24_candidates = (
+        market.get("volume24h"),
+        market.get("volume24Hr"),
+        market.get("volume24Hour"),
+        market.get("volume_24h"),
+        market.get("lastDayVolume"),
+    )
+    volume_24h = next((val for val in vol24_candidates if val is not None), None)
+
+    total_volume_candidates = (
+        market.get("volume"),
+        market.get("totalVolume"),
+        market.get("volume_num"),
+        market.get("volumeNum"),
+    )
+    total_volume = next((val for val in total_volume_candidates if val is not None), None)
+
+    price_line = (
+        f"[TRACE]   金额：liquidity={_format_trace_numeric(liquidity)} "
+        f"volume24h={_format_trace_numeric(volume_24h)} "
+        f"totalVolume={_format_trace_numeric(total_volume)}"
+    )
+
+    outcome_prices = _format_trace_sequence_display(market.get("outcomePrices"), numeric=True)
+    best_bids = _format_trace_sequence_display(market.get("bestBids"), numeric=True)
+    best_asks = _format_trace_sequence_display(market.get("bestAsks"), numeric=True)
+
+    quotes_line = (
+        f"[TRACE]   报价：outcomePrices={outcome_prices} "
+        f"bestBids={best_bids} bestAsks={best_asks}"
+    )
+
+    token_ids = market.get("clobTokenIds") or market.get("clobTokens")
+    tag_values = market.get("tags") or market.get("tagNames") or market.get("categories")
+    misc_line = (
+        f"[TRACE]   其他：clobTokenIds={_format_trace_sequence_display(token_ids)} "
+        f"tags={_format_trace_sequence_display(tag_values, limit=6)}"
+    )
+
+    end_raw = next((market.get(key) for key in _TIMESTAMP_KEYS if market.get(key) is not None), None)
+    time_line = f"[TRACE]   时间：raw_end={end_raw or '-'}"
+
+    return "\n".join((status_line, price_line, quotes_line, misc_line, time_line))
+
+
+def _format_trace_snapshot(snapshot: MarketSnapshot) -> str:
+    summary = summarize_market(snapshot)
+    indented = "\n".join("[TRACE]     " + line for line in summary.splitlines())
+    return "[TRACE]   解析结果：\n" + indented
+
+
 def filter_markets(
     markets: Iterable[Dict[str, Any]],
     cfg: MarketFilterConfig,
     *,
     diagnostics: Optional[FilterDiagnostics] = None,
     allow_orderbook_backfill: bool = True,
+    trace: bool = False,
 ) -> List[MarketSnapshot]:
     snapshots: List[MarketSnapshot] = []
-    for market in markets:
+    market_list = list(markets)
+    total = len(market_list)
+    for index, market in enumerate(market_list, 1):
         if diagnostics is not None:
             diagnostics.total += 1
+        if trace:
+            print(_format_trace_raw_market(index, total, market))
         try:
             snapshot = build_market_snapshot(market)
         except Exception as exc:
@@ -1105,16 +1242,28 @@ def filter_markets(
             if diagnostics is not None:
                 reason = f"解析失败({exc.__class__.__name__})"
                 diagnostics.record_failure(reason, market=market)
+            if trace:
+                print(f"[TRACE]   -> 解析失败，跳过（{exc}）。")
             continue
         if cfg.require_trading and allow_orderbook_backfill:
             _maybe_backfill_quotes(snapshot)
         passed, reason = market_passes_with_reason(snapshot, cfg)
+        if trace:
+            print(_format_trace_snapshot(snapshot))
         if passed:
             if diagnostics is not None:
                 diagnostics.record_pass()
             snapshots.append(snapshot)
+            if trace:
+                print("[TRACE]   -> 结果：通过。")
         elif diagnostics is not None:
             diagnostics.record_failure(reason, snapshot=snapshot)
+            if trace:
+                print(f"[TRACE]   -> 结果：淘汰（{reason}）。")
+        elif trace:
+            print(f"[TRACE]   -> 结果：淘汰（{reason}）。")
+        if trace:
+            print("[TRACE]   --------------------------------------------------")
     return snapshots
 
 
@@ -1221,6 +1370,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=5,
         help="每种淘汰原因保留的示例数量（默认 5）",
     )
+    parser.add_argument(
+        "--no-trace",
+        action="store_true",
+        help="关闭逐市场的详细日志输出",
+    )
 
     args = parser.parse_args(argv)
 
@@ -1242,12 +1396,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("[WARN] 未获取到任何市场，请检查网络或输入参数。")
         return 1
 
+    if not args.no_trace:
+        print(f"[TRACE] 成功获取 {len(markets)} 个市场，开始逐一解析……")
+
     start_filter = time.perf_counter()
     snapshots = filter_markets(
         markets,
         cfg,
         diagnostics=diagnostics,
         allow_orderbook_backfill=not args.skip_orderbook,
+        trace=not args.no_trace,
     )
     elapsed = time.perf_counter() - start_filter
 
