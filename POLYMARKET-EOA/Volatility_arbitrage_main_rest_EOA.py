@@ -42,8 +42,26 @@ _CLIENT_SINGLETON: Optional[ClobClient] = None
 
 def _api_creds_to_dict(creds) -> dict:
     """最大化从凭据对象中提取字段，以兼容多种返回结构。"""
+    if creds is None:
+        return {}
     if isinstance(creds, dict):
         return creds
+    if hasattr(creds, "_asdict"):
+        try:
+            maybe_map = creds._asdict()  # type: ignore[attr-defined]
+        except Exception:
+            maybe_map = None
+        else:
+            if isinstance(maybe_map, dict):
+                return maybe_map
+    if hasattr(creds, "items"):
+        try:
+            maybe_map = dict(creds.items())  # type: ignore[arg-type]
+        except Exception:
+            maybe_map = None
+        else:
+            if isinstance(maybe_map, dict):
+                return maybe_map
     if hasattr(creds, "to_dict"):
         try:
             maybe_map = creds.to_dict()  # type: ignore[attr-defined]
@@ -55,8 +73,22 @@ def _api_creds_to_dict(creds) -> dict:
     if hasattr(creds, "__dict__"):
         raw = vars(creds)
         if isinstance(raw, dict):
-            return {k: v for k, v in raw.items() if not k.startswith("_")}
-    return {}
+            public = {k: v for k, v in raw.items() if not k.startswith("_")}
+            if public:
+                return public
+    # 兜底处理 __slots__ 等无 __dict__ 的对象。
+    attrs = {}
+    for name in dir(creds):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(creds, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        attrs[name] = value
+    return attrs
 
 
 def _extract_api_field(creds, *names) -> Optional[str]:
@@ -65,11 +97,45 @@ def _extract_api_field(creds, *names) -> Optional[str]:
         val = mp.get(name)
         if val:
             return str(val)
-    for name in names:
-        if hasattr(creds, name):
-            val = getattr(creds, name)
+    if hasattr(creds, "__getitem__"):
+        for name in names:
+            try:
+                val = creds[name]  # type: ignore[index]
+            except Exception:
+                continue
             if val:
                 return str(val)
+    for name in names:
+        if hasattr(creds, name):
+            try:
+                val = getattr(creds, name)
+            except Exception:
+                continue
+            if val:
+                return str(val)
+    # 针对序列结构（如 tuple/list）按约定顺序取值
+    if isinstance(creds, (tuple, list)):
+        index_map = {
+            "key": 0,
+            "api_key": 0,
+            "apiKey": 0,
+            "id": 0,
+            "secret": 1,
+            "apiSecret": 1,
+            "passphrase": 2,
+            "apiPassphrase": 2,
+        }
+        for name in names:
+            idx = index_map.get(name)
+            if idx is None:
+                continue
+            if idx < len(creds):
+                try:
+                    candidate = creds[idx]
+                except Exception:
+                    continue
+                if candidate:
+                    return str(candidate)
     return None
 
 
@@ -202,16 +268,16 @@ def get_api_creds_tuple():
     c = get_client()
     creds = getattr(c, "api_creds", None)
     # 兼容多种返回结构
-    def _from_map(mp):
-        if not isinstance(mp, dict):
+    def _from_creds(obj):
+        if obj is None:
             return None
-        key = _extract_api_key(mp)
-        sec = _extract_api_field(mp, "secret", "apiSecret")
-        pas = _extract_api_field(mp, "passphrase", "apiPassphrase")
+        key = _extract_api_key(obj)
+        sec = _extract_api_field(obj, "secret", "apiSecret")
+        pas = _extract_api_field(obj, "passphrase", "apiPassphrase")
         if key != "<missing>" and sec:
             return (str(key), str(sec), (str(pas) if pas else None))
         return None
-    tup = _from_map(_api_creds_to_dict(creds))
+    tup = _from_creds(creds)
     if tup:
         return tup
     # 3) 兜底：直接派生一次
@@ -221,9 +287,9 @@ def get_api_creds_tuple():
         setattr(c, "api_creds", fresh)
     except Exception:
         pass
-    mp = _api_creds_to_dict(fresh)
-    if mp:
-        return _from_map(mp) or (None, None, None)
+    tup = _from_creds(fresh)
+    if tup:
+        return tup
     return (None, None, None)
 
 
