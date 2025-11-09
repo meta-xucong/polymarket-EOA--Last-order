@@ -104,28 +104,6 @@ USER_AGENT = (
 
 _ORDERBOOK_CACHE: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
 
-_ORDERBOOK_METHOD_CANDIDATES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("get_market_orderbook", ("market",)),
-    ("get_market_orderbook", ("token_id",)),
-    ("get_market_orderbook", ("market_id",)),
-    ("get_market_orderbook", ("tokenId",)),
-    ("get_order_book", ("market",)),
-    ("get_order_book", ("token_id",)),
-    ("get_order_book", ("tokenId",)),
-    ("get_orderbook", ("market",)),
-    ("get_orderbook", ("token_id",)),
-    ("get_orderbook", ("tokenId",)),
-    ("get_market", ("market",)),
-    ("get_market", ("token_id",)),
-    ("get_market", ("tokenId",)),
-    ("get_market_data", ("market",)),
-    ("get_market_data", ("token_id",)),
-    ("get_market_data", ("tokenId",)),
-    ("get_ticker", ("market",)),
-    ("get_ticker", ("token_id",)),
-    ("get_ticker", ("tokenId",)),
-)
-
 
 _API_KEY_FIELDS = ("key", "apiKey", "api_key", "id", "apiId", "api_id")
 _API_SECRET_FIELDS = ("secret", "apiSecret", "api_secret", "apiSecretKey")
@@ -645,18 +623,6 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
         token_id = outcome.get("tokenId") or outcome.get("clobTokenId") or outcome.get("clob_token_id")
         if token_id is not None:
             token_id = str(token_id)
-        best_bid = _coerce_float(
-            outcome.get("bestBid")
-            or outcome.get("best_bid")
-            or outcome.get("bid")
-            or outcome.get("bestBidPrice")
-        )
-        best_ask = _coerce_float(
-            outcome.get("bestAsk")
-            or outcome.get("best_ask")
-            or outcome.get("ask")
-            or outcome.get("bestAskPrice")
-        )
         last_price = _coerce_float(
             outcome.get("lastPrice")
             or outcome.get("price")
@@ -673,8 +639,6 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
         outcomes[side] = OutcomeSnapshot(
             side=side,
             token_id=token_id,
-            best_bid=best_bid,
-            best_ask=best_ask,
             last_price=last_price,
             volume_24h=vol24,
             total_volume=total_vol,
@@ -708,31 +672,45 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
 
 
 def _extract_best_prices(orderbook: Any) -> Tuple[Optional[float], Optional[float]]:
-    if not isinstance(orderbook, dict):
-        return None, None
-    bids = orderbook.get("bids") or orderbook.get("bid") or []
-    asks = orderbook.get("asks") or orderbook.get("ask") or []
+    if not isinstance(orderbook, MappingABC):
+        raise TypeError("订单簿响应格式错误：缺少映射结构")
+
+    payload = orderbook
+    if "data" in payload and isinstance(payload.get("data"), MappingABC):
+        payload = payload["data"]
+
+    if not isinstance(payload, MappingABC):
+        raise TypeError("订单簿响应格式错误：data 字段不是映射")
+
+    if "bids" not in payload or "asks" not in payload:
+        missing = {key for key in ("bids", "asks") if key not in payload}
+        raise KeyError(f"订单簿缺少必要字段：{', '.join(sorted(missing))}")
 
     def _first_price(levels: Any) -> Optional[float]:
-        if isinstance(levels, dict):
-            levels = levels.values()
+        if isinstance(levels, MappingABC):
+            levels = levels.get("levels")
+        if not isinstance(levels, IterableABC) or isinstance(levels, (str, bytes, bytearray)):
+            raise TypeError("订单簿价格梯度格式错误")
         for level in levels:
-            if isinstance(level, dict):
-                price = _coerce_float(
-                    level.get("price")
-                    or level.get("limitPrice")
-                    or level.get("limit_price")
-                    or level.get("p")
-                )
-                if price is not None:
-                    return price
-            elif isinstance(level, (list, tuple)) and level:
-                price = _coerce_float(level[0])
-                if price is not None:
-                    return price
+            if isinstance(level, MappingABC):
+                price = _coerce_float(level.get("price"))
+            else:
+                price = _coerce_float(level)
+            if price is not None:
+                return price
         return None
 
-    return _first_price(bids), _first_price(asks)
+    return _first_price(payload["bids"]), _first_price(payload["asks"])
+
+
+def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Optional[float]]:
+    orderbook = client.get_market_orderbook(market=token_id)
+
+    if isinstance(orderbook, tuple) and len(orderbook) == 2:
+        orderbook = orderbook[1]
+
+    bid, ask = _extract_best_prices(orderbook)
+    return bid, ask
 
 
 def _extract_best_quote(payload: Any, *, side: str) -> Optional[float]:
