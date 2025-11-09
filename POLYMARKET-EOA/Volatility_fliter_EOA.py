@@ -24,6 +24,7 @@ import math
 import os
 import sys
 import time
+from collections.abc import Iterable as IterableABC, Mapping as MappingABC
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,54 @@ from urllib import error, parse, request
 from Volatility_arbitrage_main_rest_EOA import get_client as get_eoa_client
 from Volatility_arbitrage_main_rest_EOA import get_api_creds_tuple
 from Volatility_arbitrage_price_watch_EOA import resolve_token_ids
+
+DEFAULT_BANNED_KEYWORDS: Tuple[str, ...] = (
+    "Bitcoin",
+    "BTC",
+    "ETH",
+    "Ethereum",
+    "Sol",
+    "Solana",
+    "Doge",
+    "Dogecoin",
+    "BNB",
+    "Binance",
+    "Cardano",
+    "ADA",
+    "XRP",
+    "Ripple",
+    "Matic",
+    "Polygon",
+    "Crypto",
+    "Cryptocurrency",
+    "Blockchain",
+    "Token",
+    "NFT",
+    "DeFi",
+    "vs",
+    "odds",
+    "score",
+    "spread",
+    "moneyline",
+    "Esports",
+    "CS2",
+    "Cup",
+    "Arsenal",
+    "Liverpool",
+    "Chelsea",
+    "EPL",
+    "PGA",
+    "Tour Championship",
+    "Scottie Scheffler",
+    "Vitality",
+    "MOUZ",
+    "Falcons",
+    "The MongolZ",
+    "AL",
+    "Houston",
+    "Chicago",
+    "New York",
+)
 
 __all__ = [
     "MarketFilterConfig",
@@ -53,7 +102,7 @@ USER_AGENT = (
     "Chrome/123.0.0.0 Safari/537.36"
 )
 
-_ORDERBOOK_CACHE: Dict[str, Any] = {}
+_ORDERBOOK_CACHE: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
 
 
 _API_KEY_FIELDS = ("key", "apiKey", "api_key", "id", "apiId", "api_id")
@@ -358,18 +407,23 @@ class MarketSnapshot:
 
 @dataclass
 class MarketFilterConfig:
-    min_liquidity: float = 1_000.0
-    min_volume_24h: float = 1_000.0
+    min_liquidity: float = 0.0
+    min_volume_24h: float = 0.0
+    min_total_volume: float = 100_000.0
     min_yes_bid: Optional[float] = None
     max_yes_ask: Optional[float] = None
     min_no_bid: Optional[float] = None
     max_no_ask: Optional[float] = None
-    max_spread: Optional[float] = 0.20
-    max_end_hours: Optional[float] = None
+    max_spread: Optional[float] = None
+    min_hours_to_end: Optional[float] = 24.0
+    max_end_hours: Optional[float] = 183 * 24.0
     require_active: bool = True
     require_binary: bool = True
-    require_trading: bool = True
-    banned_keywords: Tuple[str, ...] = ()
+    require_trading: bool = False
+    require_accepting_orders: bool = True
+    min_yes_price: Optional[float] = 0.06
+    max_yes_price: Optional[float] = 0.94
+    banned_keywords: Tuple[str, ...] = DEFAULT_BANNED_KEYWORDS
     only_keywords: Tuple[str, ...] = ()
 
 
@@ -569,18 +623,6 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
         token_id = outcome.get("tokenId") or outcome.get("clobTokenId") or outcome.get("clob_token_id")
         if token_id is not None:
             token_id = str(token_id)
-        best_bid = _coerce_float(
-            outcome.get("bestBid")
-            or outcome.get("best_bid")
-            or outcome.get("bid")
-            or outcome.get("bestBidPrice")
-        )
-        best_ask = _coerce_float(
-            outcome.get("bestAsk")
-            or outcome.get("best_ask")
-            or outcome.get("ask")
-            or outcome.get("bestAskPrice")
-        )
         last_price = _coerce_float(
             outcome.get("lastPrice")
             or outcome.get("price")
@@ -597,8 +639,6 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
         outcomes[side] = OutcomeSnapshot(
             side=side,
             token_id=token_id,
-            best_bid=best_bid,
-            best_ask=best_ask,
             last_price=last_price,
             volume_24h=vol24,
             total_volume=total_vol,
@@ -632,31 +672,45 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
 
 
 def _extract_best_prices(orderbook: Any) -> Tuple[Optional[float], Optional[float]]:
-    if not isinstance(orderbook, dict):
-        return None, None
-    bids = orderbook.get("bids") or orderbook.get("bid") or []
-    asks = orderbook.get("asks") or orderbook.get("ask") or []
+    if not isinstance(orderbook, MappingABC):
+        raise TypeError("订单簿响应格式错误：缺少映射结构")
+
+    payload = orderbook
+    if "data" in payload and isinstance(payload.get("data"), MappingABC):
+        payload = payload["data"]
+
+    if not isinstance(payload, MappingABC):
+        raise TypeError("订单簿响应格式错误：data 字段不是映射")
+
+    if "bids" not in payload or "asks" not in payload:
+        missing = {key for key in ("bids", "asks") if key not in payload}
+        raise KeyError(f"订单簿缺少必要字段：{', '.join(sorted(missing))}")
 
     def _first_price(levels: Any) -> Optional[float]:
-        if isinstance(levels, dict):
-            levels = levels.values()
+        if isinstance(levels, MappingABC):
+            levels = levels.get("levels")
+        if not isinstance(levels, IterableABC) or isinstance(levels, (str, bytes, bytearray)):
+            raise TypeError("订单簿价格梯度格式错误")
         for level in levels:
-            if isinstance(level, dict):
-                price = _coerce_float(
-                    level.get("price")
-                    or level.get("limitPrice")
-                    or level.get("limit_price")
-                    or level.get("p")
-                )
-                if price is not None:
-                    return price
-            elif isinstance(level, (list, tuple)) and level:
-                price = _coerce_float(level[0])
-                if price is not None:
-                    return price
+            if isinstance(level, MappingABC):
+                price = _coerce_float(level.get("price"))
+            else:
+                price = _coerce_float(level)
+            if price is not None:
+                return price
         return None
 
-    return _first_price(bids), _first_price(asks)
+    return _first_price(payload["bids"]), _first_price(payload["asks"])
+
+
+def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Optional[float]]:
+    orderbook = client.get_market_orderbook(market=token_id)
+
+    if isinstance(orderbook, tuple) and len(orderbook) == 2:
+        orderbook = orderbook[1]
+
+    bid, ask = _extract_best_prices(orderbook)
+    return bid, ask
 
 
 def _maybe_backfill_quotes(snapshot: MarketSnapshot) -> None:
@@ -674,21 +728,14 @@ def _maybe_backfill_quotes(snapshot: MarketSnapshot) -> None:
         if not (need_bid or need_ask):
             continue
 
-        orderbook = _ORDERBOOK_CACHE.get(outcome.token_id)
-        if orderbook is None:
-            try:
-                orderbook = client.get_order_book(outcome.token_id)
-            except TypeError:
-                try:
-                    orderbook = client.get_order_book(token_id=outcome.token_id)
-                except Exception:
-                    continue
-            except Exception:
-                continue
-            if orderbook is not None:
-                _ORDERBOOK_CACHE[outcome.token_id] = orderbook
+        cached = _ORDERBOOK_CACHE.get(outcome.token_id)
+        if cached is not None:
+            bid, ask = cached
+        else:
+            bid, ask = _fetch_best_quotes(client, outcome.token_id)
+            if bid is not None or ask is not None:
+                _ORDERBOOK_CACHE[outcome.token_id] = (bid, ask)
 
-        bid, ask = _extract_best_prices(orderbook)
         if need_bid and bid is not None:
             outcome.best_bid = bid
         if need_ask and ask is not None:
@@ -819,6 +866,11 @@ def market_passes_with_reason(
     if snapshot.is_resolved:
         return False, "市场已结算"
 
+    if cfg.require_accepting_orders:
+        accepting = snapshot.raw.get("acceptingOrders")
+        if accepting is False:
+            return False, "暂停接单"
+
     if cfg.min_liquidity > 0:
         if snapshot.liquidity is None or snapshot.liquidity < cfg.min_liquidity:
             return False, "流动性不足"
@@ -826,6 +878,10 @@ def market_passes_with_reason(
     if cfg.min_volume_24h > 0:
         if snapshot.volume_24h is None or snapshot.volume_24h < cfg.min_volume_24h:
             return False, "24h 成交量不足"
+
+    if cfg.min_total_volume > 0:
+        if snapshot.total_volume is None or snapshot.total_volume < cfg.min_total_volume:
+            return False, "总成交量不足"
 
     if cfg.min_yes_bid is not None:
         if not yes or yes.best_bid is None or yes.best_bid < cfg.min_yes_bid:
@@ -851,11 +907,24 @@ def market_passes_with_reason(
         if spreads and max(spreads) > cfg.max_spread:
             return False, "点差超过阈值"
 
-    if cfg.max_end_hours is not None and snapshot.hours_to_end is not None:
+    if snapshot.hours_to_end is not None:
         if snapshot.hours_to_end < 0:
             return False, "市场已过期"
-        if snapshot.hours_to_end > cfg.max_end_hours:
+        if cfg.min_hours_to_end is not None and snapshot.hours_to_end < cfg.min_hours_to_end:
+            return False, "距离结束时间过短"
+        if cfg.max_end_hours is not None and snapshot.hours_to_end > cfg.max_end_hours:
             return False, "距离结束时间过长"
+    elif cfg.min_hours_to_end is not None or cfg.max_end_hours is not None:
+        return False, "缺少结束时间"
+
+    if cfg.min_yes_price is not None or cfg.max_yes_price is not None:
+        yes_price = _resolve_yes_price(snapshot)
+        if yes_price is None:
+            return False, "缺少 YES 价格"
+        if cfg.min_yes_price is not None and yes_price < cfg.min_yes_price:
+            return False, "YES 价格低于阈值"
+        if cfg.max_yes_price is not None and yes_price > cfg.max_yes_price:
+            return False, "YES 价格高于阈值"
 
     if cfg.banned_keywords and _keyword_hit(snapshot.title, cfg.banned_keywords):
         return False, "命中排除关键字"
@@ -864,6 +933,27 @@ def market_passes_with_reason(
         return False, "未命中限定关键字"
 
     return True, "通过"
+
+
+def _resolve_yes_price(snapshot: MarketSnapshot) -> Optional[float]:
+    yes = snapshot.yes
+    if yes:
+        for candidate in (yes.best_ask, yes.best_bid, yes.last_price):
+            if candidate is not None:
+                return candidate
+
+    raw_prices = snapshot.raw.get("outcomePrices") if isinstance(snapshot.raw, dict) else None
+    if isinstance(raw_prices, str):
+        try:
+            raw_prices = json.loads(raw_prices)
+        except Exception:
+            raw_prices = None
+    if isinstance(raw_prices, (list, tuple)) and raw_prices:
+        try:
+            return float(raw_prices[0])
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def market_passes(snapshot: MarketSnapshot, cfg: MarketFilterConfig) -> bool:
@@ -944,16 +1034,21 @@ def _cli_build_config(args: argparse.Namespace) -> MarketFilterConfig:
     return MarketFilterConfig(
         min_liquidity=args.min_liquidity,
         min_volume_24h=args.min_volume_24h,
+        min_total_volume=args.min_total_volume,
         min_yes_bid=args.min_yes_bid,
         max_yes_ask=args.max_yes_ask,
         min_no_bid=args.min_no_bid,
         max_no_ask=args.max_no_ask,
         max_spread=args.max_spread,
+        min_hours_to_end=args.min_end_hours,
         max_end_hours=args.max_end_hours,
         require_active=not args.include_inactive,
         require_binary=not args.allow_non_binary,
         require_trading=not args.allow_illiquid,
-        banned_keywords=tuple(args.exclude or ()),
+        require_accepting_orders=not args.allow_paused,
+        min_yes_price=args.min_yes_price,
+        max_yes_price=args.max_yes_price,
+        banned_keywords=tuple(args.exclude) if args.exclude is not None else DEFAULT_BANNED_KEYWORDS,
         only_keywords=tuple(args.only or ()),
     )
 
@@ -967,18 +1062,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--from-file", type=Path, help="从本地 JSON 文件加载 markets 数据，跳过网络请求")
     parser.add_argument("--output-json", action="store_true", help="以 JSON 格式输出筛选结果")
 
-    parser.add_argument("--min-liquidity", type=float, default=1_000.0, help="最小市场流动性（美元）")
-    parser.add_argument("--min-volume-24h", type=float, default=1_000.0, help="过去 24h 最小成交量（美元）")
+    parser.add_argument("--min-liquidity", type=float, default=0.0, help="最小市场流动性（美元）")
+    parser.add_argument("--min-volume-24h", type=float, default=0.0, help="过去 24h 最小成交量（美元）")
+    parser.add_argument("--min-total-volume", type=float, default=100_000.0, help="最小总成交量（美元）")
     parser.add_argument("--min-yes-bid", type=float, default=None, help="YES 最低买价门槛")
     parser.add_argument("--max-yes-ask", type=float, default=None, help="YES 最高卖价门槛")
     parser.add_argument("--min-no-bid", type=float, default=None, help="NO 最低买价门槛")
     parser.add_argument("--max-no-ask", type=float, default=None, help="NO 最高卖价门槛")
-    parser.add_argument("--max-spread", type=float, default=0.20, help="允许的最大点差（bid/ask 差）")
-    parser.add_argument("--max-end-hours", type=float, default=None, help="距离结束的最大小时数，默认不限")
+    parser.add_argument("--max-spread", type=float, default=None, help="允许的最大点差（bid/ask 差）")
+    parser.add_argument("--min-end-hours", type=float, default=24.0, help="距离结束的最小时数")
+    parser.add_argument("--max-end-hours", type=float, default=183 * 24.0, help="距离结束的最大小时数")
+    parser.add_argument("--min-yes-price", type=float, default=0.06, help="YES 价格下限")
+    parser.add_argument("--max-yes-price", type=float, default=0.94, help="YES 价格上限")
 
     parser.add_argument("--include-inactive", action="store_true", help="保留 inactive / closed 市场")
     parser.add_argument("--allow-non-binary", action="store_true", help="允许缺失 YES/NO 任一 outcome 的市场")
     parser.add_argument("--allow-illiquid", action="store_true", help="允许无买卖报价的市场")
+    parser.add_argument("--allow-paused", action="store_true", help="允许 acceptingOrders=False 的市场")
     parser.add_argument("--skip-orderbook", action="store_true", help="跳过订单簿补全报价，加速诊断")
 
     parser.add_argument("--exclude", nargs="*", help="标题包含任意关键字则剔除")
