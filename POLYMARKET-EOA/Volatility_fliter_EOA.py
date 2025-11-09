@@ -713,6 +713,132 @@ def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Opt
     return bid, ask
 
 
+def _extract_best_quote(payload: Any, *, side: str) -> Optional[float]:
+    numeric = _coerce_float(payload)
+    if numeric is not None:
+        return numeric
+
+    if isinstance(payload, MappingABC):
+        if side == "ask":
+            primary_keys = (
+                "best_ask",
+                "bestAsk",
+                "ask",
+                "offer",
+                "best_offer",
+                "bestOffer",
+                "lowest_ask",
+                "lowestAsk",
+                "sell",
+            )
+            ladder_keys = (
+                "asks",
+                "ask_levels",
+                "sell_orders",
+                "sellOrders",
+                "offers",
+            )
+        else:
+            primary_keys = (
+                "best_bid",
+                "bestBid",
+                "bid",
+                "highest_bid",
+                "highestBid",
+                "buy",
+            )
+            ladder_keys = (
+                "bids",
+                "bid_levels",
+                "buy_orders",
+                "buyOrders",
+                "orders",
+            )
+
+        for key in primary_keys:
+            if key in payload:
+                extracted = _extract_best_quote(payload[key], side=side)
+                if extracted is not None:
+                    return extracted
+
+        for key in ladder_keys:
+            if key not in payload:
+                continue
+            ladder = payload[key]
+            if isinstance(ladder, IterableABC) and not isinstance(
+                ladder, (str, bytes, bytearray)
+            ):
+                for entry in ladder:
+                    if isinstance(entry, MappingABC):
+                        candidate = _coerce_float(
+                            entry.get("price")
+                            or entry.get("limitPrice")
+                            or entry.get("limit_price")
+                            or entry.get("p")
+                        )
+                        if candidate is not None:
+                            return candidate
+                        extracted = _extract_best_quote(entry, side=side)
+                        if extracted is not None:
+                            return extracted
+                    elif isinstance(entry, IterableABC) and not isinstance(
+                        entry, (str, bytes, bytearray)
+                    ):
+                        for item in entry:
+                            extracted = _extract_best_quote(item, side=side)
+                            if extracted is not None:
+                                return extracted
+
+        for value in payload.values():
+            extracted = _extract_best_quote(value, side=side)
+            if extracted is not None:
+                return extracted
+        return None
+
+    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            extracted = _extract_best_quote(item, side=side)
+            if extracted is not None:
+                return extracted
+
+    return None
+
+
+def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Optional[float]]:
+    for name, arg_keys in _ORDERBOOK_METHOD_CANDIDATES:
+        fn = getattr(client, name, None)
+        if not callable(fn):
+            continue
+
+        kwargs = {key: token_id for key in arg_keys}
+
+        try:
+            resp = fn(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            continue
+
+        payload = resp
+        if isinstance(resp, tuple) and len(resp) == 2:
+            payload = resp[1]
+
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+            payload = payload.get("data")
+
+        if isinstance(payload, MappingABC):
+            bid, ask = _extract_best_prices(payload)
+            if bid is not None or ask is not None:
+                return bid, ask
+
+        bid = _extract_best_quote(payload, side="bid")
+        ask = _extract_best_quote(payload, side="ask")
+        if bid is not None or ask is not None:
+            return bid, ask
+
+    return None, None
+
+
 def _maybe_backfill_quotes(snapshot: MarketSnapshot) -> None:
     try:
         client = get_eoa_client()
