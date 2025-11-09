@@ -60,7 +60,7 @@ def _describe_auth_context() -> None:
         key_mask = f"{api_key[:6]}***{api_key[-4:]}" if len(api_key) >= 10 else "***"
         print(f"[INFO] 已加载 EOA API credentials：{key_mask}")
     else:
-        print("[WARN] 未能从 EOA 私钥派生 API credentials，请确认环境变量。")
+        print("[WARN] 当前未检测到有效的 EOA API credentials，请核对环境变量或私钥配置。")
 
 
 def _coerce_float(value: Any) -> Optional[float]:
