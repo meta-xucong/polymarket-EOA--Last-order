@@ -45,7 +45,12 @@ __all__ = [
 ]
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-USER_AGENT = "VolatilityFilterEOA/2025-11"
+# 一些企业代理会拒绝未知的 UA，这里模仿主流浏览器字符串降低被拦截概率
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
+)
 
 _ORDERBOOK_CACHE: Dict[str, Any] = {}
 
@@ -368,19 +373,64 @@ class MarketFilterConfig:
 
 
 def _http_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Optional[Any]:
-    query = parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
+    params = {k: v for k, v in (params or {}).items() if v is not None}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+    # requests 对代理与 TLS 的兼容性更好，优先尝试（与旧版本行为保持一致）。
+    try:
+        import requests  # type: ignore
+    except Exception:
+        requests = None  # type: ignore
+
+    if requests is not None:
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.JSONDecodeError, ValueError):
+            final_url = resp.url if 'resp' in locals() else url  # type: ignore[name-defined]
+            print(f"[WARN] 无法解析 JSON：{final_url}")
+            return None
+        except requests.RequestException as exc:
+            print(f"[WARN] 网络请求失败：{exc}")
+            # 若是 requests 专属问题（如模块未安装 CA），回退到 urllib
+
+    query = parse.urlencode(params)
     full_url = f"{url}?{query}" if query else url
-    req = request.Request(full_url, headers={"User-Agent": USER_AGENT})
+    req = request.Request(full_url, headers=headers)
     try:
         with request.urlopen(req, timeout=timeout) as resp:
             if resp.status >= 400:
                 raise error.HTTPError(full_url, resp.status, resp.reason, resp.headers, None)
-            data = resp.read().decode("utf-8")
+            raw = resp.read()
+            encoding = resp.headers.get("Content-Encoding", "").lower()
+            if encoding == "gzip":
+                import gzip
+
+                data = gzip.decompress(raw).decode("utf-8")
+            elif encoding == "deflate":
+                import zlib
+
+                data = zlib.decompress(raw, -zlib.MAX_WBITS).decode("utf-8")
+            else:
+                data = raw.decode("utf-8")
     except error.HTTPError as exc:
         print(f"[WARN] HTTP {exc.code} {exc.reason} when requesting {full_url}")
         return None
     except error.URLError as exc:
         print(f"[WARN] 网络请求失败：{exc}")
+        return None
+    except Exception as exc:
+        print(f"[WARN] 读取响应失败：{exc}")
         return None
     try:
         return json.loads(data)
