@@ -11,9 +11,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import re
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     import requests
@@ -373,6 +374,30 @@ def _final_pass_reason(ms: MarketSnapshot, require_quotes: bool) -> Tuple[bool, 
 # 打印
 # -------------------------------
 
+BLACKLIST_TERMS = [
+    "Bitcoin","BTC","ETH","Ethereum","Sol","Solana","Doge","Dogecoin",
+    "BNB","Binance","Cardano","ADA","XRP","Ripple","Matic","Polygon",
+    "Crypto","Cryptocurrency","Blockchain","Token","NFT","DeFi",
+    "vs","odds","score","spread","moneyline",
+    "Esports","CS2","Cup","Arsenal","Liverpool","Chelsea",
+    "EPL","PGA","Tour Championship","Scottie Scheffler",
+    "Vitality","MOUZ","Falcons","The MongolZ","AL","Houston","Chicago","New York",
+]
+
+def _build_blacklist_patterns(terms: Iterable[str]) -> List[Tuple[str, re.Pattern[str]]]:
+    patterns: List[Tuple[str, re.Pattern[str]]] = []
+    for term in terms:
+        tl = term.lower()
+        if len(tl) <= 3 and tl.isalpha():
+            pat = re.compile(rf"\b{re.escape(tl)}\b", re.IGNORECASE)
+        else:
+            pat = re.compile(re.escape(term), re.IGNORECASE)
+        patterns.append((term, pat))
+    return patterns
+
+BLACKLIST_PATTERNS = _build_blacklist_patterns(BLACKLIST_TERMS)
+
+
 def _print_snapshot(idx: int, total: int, ms: MarketSnapshot):
     print(f"[TRACE] [{idx}/{total}] 原始市场：slug={ms.slug} | 标题={ms.title}")
     st = " ".join([
@@ -405,6 +430,48 @@ def _print_singleline(ms: MarketSnapshot, reason: str):
     na = "-" if ms.no.ask is None else f"{ms.no.ask:.4f}"
     h  = _hours_until(ms.end_time)
     print(f"[RES] {ms.slug} | {ms.title} | YES {yb}/{ya} NO {nb}/{na} | ends_in={h}h | {reason}", flush=True)
+
+
+def _blacklist_hit(ms: MarketSnapshot) -> Optional[str]:
+    parts = [ms.title or "", ms.slug or ""]
+    if ms.tags:
+        parts.append(" ".join(ms.tags))
+    haystack = " ".join(filter(None, parts))
+    for term, pat in BLACKLIST_PATTERNS:
+        if pat.search(haystack):
+            return term
+    return None
+
+
+def _highlight_outcomes(ms: MarketSnapshot, max_hours: float = 48.0, ask_min: float = 0.98, ask_max: float = 0.995) -> List[Tuple[OutcomeSnapshot, float]]:
+    hours = _hours_until(ms.end_time)
+    if hours is None or hours < 0 or hours > max_hours:
+        return []
+    if _blacklist_hit(ms):
+        return []
+    matches: List[Tuple[OutcomeSnapshot, float]] = []
+    for snap in (ms.yes, ms.no):
+        if snap.ask is not None and ask_min <= snap.ask <= ask_max:
+            matches.append((snap, hours))
+    return matches
+
+
+def _print_highlighted(highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]]) -> None:
+    if not highlights:
+        print("[INFO] 当前无满足（48h 内 & ask 在 0.98-0.995 且非黑名单）条件的选项。")
+        return
+
+    print("[INFO] 满足（48h 内 & ask 在 0.98-0.995 且非黑名单）条件的选项：")
+    for idx, (ms, snap, hours) in enumerate(highlights, start=1):
+        bid = "-" if snap.bid is None else f"{snap.bid:.4f}"
+        ask = "-" if snap.ask is None else f"{snap.ask:.4f}"
+        end_iso = ms.end_time.isoformat() if ms.end_time else "-"
+        print(
+            f"  [{idx}] slug={ms.slug} | 标题={ms.title} | 方向={snap.name}"
+            f" | token_id={snap.token_id or '-'} | bid/ask={bid}/{ask}"
+            f" | ends_in={hours}h | end_time={end_iso}"
+        )
+
 
 # -------------------------------
 # 主流程（含流式模式）
@@ -463,6 +530,7 @@ def main():
         total = len(mkts_raw)
         processed = 0
         chosen_cnt = 0
+        highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]] = []
         for s in range(0, total, args.stream_chunk_size):
             chunk_raw = mkts_raw[s:s + args.stream_chunk_size]
             # 解析 + 早筛（即时输出被拒绝的理由）
@@ -500,8 +568,12 @@ def main():
                     _print_singleline(ms, reason2)
                 if ok2:
                     chosen_cnt += 1
+                    for snap, hours in _highlight_outcomes(ms):
+                        highlights.append((ms, snap, hours))
                 processed += 1
 
+        print("")
+        _print_highlighted(highlights)
         print(f"\n[INFO] 通过筛选的市场数量：{chosen_cnt} / {len(mkts_raw)}")
         return
 
@@ -548,6 +620,14 @@ def main():
                 nb = "-" if ms.no.bid is None else f"{ms.no.bid:.4f}"
                 na = "-" if ms.no.ask is None else f"{ms.no.ask:.4f}"
                 print(f"  [{k}] {ms.slug} | YES bid/ask={yb}/{ya} | NO bid/ask={nb}/{na} | LQ={_fmt_money(ms.liquidity)} Vol={_fmt_money(ms.totalVolume)}")
+
+    highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]] = []
+    for ms in chosen:
+        for snap, hours in _highlight_outcomes(ms):
+            highlights.append((ms, snap, hours))
+
+    print("")
+    _print_highlighted(highlights)
 
     print("")
     print(f"[INFO] 通过筛选的市场数量：{len(chosen)} / {len(mkts_raw)}")
