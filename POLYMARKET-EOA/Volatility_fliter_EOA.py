@@ -499,7 +499,49 @@ def main():
     ap.add_argument("--stream-chunk-size", type=int, default=200, help="流式：每个分片的市场数量")
     ap.add_argument("--stream-books-batch-size", type=int, default=200, help="流式：每个分片内 REST /books 批量回补的 token_id 数量上限")
     ap.add_argument("--stream-verbose", action="store_true", help="流式：逐个输出详细块（默认仅单行）")
+    ap.add_argument(
+        "--preset",
+        choices=["slow-stream"],
+        help="预设参数组合。slow-stream：降低分片体积、启用流式输出，适合持续产出并监控运行状态。",
+    )
+    defaults = ap.parse_args(args=[])
     args = ap.parse_args()
+
+    if args.preset == "slow-stream":
+        applied: List[str] = []
+
+        if not args.stream:
+            args.stream = True
+            applied.append("stream=True")
+
+        if args.stream_chunk_size == getattr(defaults, "stream_chunk_size", None):
+            args.stream_chunk_size = 80
+            applied.append("stream_chunk_size=80")
+
+        if args.stream_books_batch_size == getattr(defaults, "stream_books_batch_size", None):
+            args.stream_books_batch_size = 80
+            applied.append("stream_books_batch_size=80")
+
+        if args.books_batch_size == getattr(defaults, "books_batch_size", None):
+            args.books_batch_size = 120
+            applied.append("books_batch_size=120")
+
+        if args.gamma_window_days == getattr(defaults, "gamma_window_days", None):
+            args.gamma_window_days = 7
+            applied.append("gamma_window_days=7")
+
+        msg_extra = ", ".join(applied) if applied else "未覆盖任何参数（均已由命令行显式指定）"
+        print(
+            "[INFO] 应用 slow-stream 预设：逐分片回补并保持持续输出，"
+            "建议在大量市场时避免长时间静默。"
+            f"（{msg_extra}）",
+            flush=True,
+        )
+    else:
+        print(
+            "[HINT] 若需稳定、持续的流式输出，可追加 --preset slow-stream 预设参数。",
+            flush=True,
+        )
 
     # 仅用于展示 API key 前缀
     try:
