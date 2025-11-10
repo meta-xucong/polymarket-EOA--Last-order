@@ -146,6 +146,7 @@ class OutcomeSnapshot:
     ask: Optional[float] = None
     last: Optional[float] = None
 
+
 @dataclass
 class MarketSnapshot:
     slug: str
@@ -162,6 +163,26 @@ class MarketSnapshot:
     resolved: Optional[bool] = None
     acceptingOrders: Optional[bool] = None
     end_time: Optional[dt.datetime] = None
+
+
+@dataclass
+class HighlightedOutcome:
+    """被严格筛选条件命中的市场-方向组合。"""
+
+    market: MarketSnapshot
+    outcome: OutcomeSnapshot
+    hours_to_end: float
+
+
+@dataclass
+class FilterResult:
+    """封装供自动化脚本复用的筛选结果。"""
+
+    total_markets: int
+    candidates: List[MarketSnapshot]
+    chosen: List[MarketSnapshot]
+    rejected: List[Tuple[MarketSnapshot, str]]
+    highlights: List[HighlightedOutcome]
 
 # -------------------------------
 # Gamma 抓取（时间切片 · 突破500）
@@ -513,6 +534,76 @@ def _highlight_label() -> str:
             f"& 总交易量≥{int(HIGHLIGHT_MIN_TOTAL_VOLUME)}USDC & 单边点差≤{HIGHLIGHT_MAX_ASK_DIFF:.2f} & 非黑名单")
 
 
+# -------------------------------
+# 面向自动化脚本的封装
+# -------------------------------
+
+def collect_filter_results(
+    *,
+    min_end_hours: float = DEFAULT_MIN_END_HOURS,
+    max_end_days: int = DEFAULT_MAX_END_DAYS,
+    gamma_window_days: int = DEFAULT_GAMMA_WINDOW_DAYS,
+    legacy_end_days: int = DEFAULT_LEGACY_END_DAYS,
+    allow_illiquid: bool = False,
+    skip_orderbook: bool = False,
+    no_rest_backfill: bool = False,
+    books_batch_size: int = 200,
+    only: str = "",
+    prefetched_markets: Optional[List[Dict[str, Any]]] = None,
+) -> FilterResult:
+    """执行一次筛选流程并返回结构化结果。"""
+
+    if prefetched_markets is None:
+        now = _now_utc()
+        end_min = now + dt.timedelta(hours=min_end_hours)
+        end_max = now + dt.timedelta(days=max_end_days)
+        mkts_raw = fetch_markets_windowed(end_min, end_max, window_days=gamma_window_days)
+    else:
+        mkts_raw = prefetched_markets
+
+    only_pat = only.lower().strip()
+
+    market_list: List[MarketSnapshot] = []
+    early_rejects: List[Tuple[MarketSnapshot, str]] = []
+
+    for raw in mkts_raw:
+        title = (raw.get("question") or raw.get("title") or "")
+        slug = (raw.get("slug") or "")
+        if only_pat and (only_pat not in title.lower() and only_pat not in slug.lower()):
+            continue
+        ms = _parse_market(raw)
+        ok, reason = _early_filter_reason(ms, min_end_hours, legacy_end_days)
+        if ok:
+            market_list.append(ms)
+        else:
+            early_rejects.append((ms, reason))
+
+    if not skip_orderbook and market_list and (not no_rest_backfill):
+        _rest_books_backfill(market_list, batch_size=books_batch_size)
+
+    chosen: List[MarketSnapshot] = []
+    rejects: List[Tuple[MarketSnapshot, str]] = early_rejects.copy()
+    for ms in market_list:
+        ok, reason = _final_pass_reason(ms, require_quotes=(not allow_illiquid))
+        if ok:
+            chosen.append(ms)
+        else:
+            rejects.append((ms, reason))
+
+    highlights: List[HighlightedOutcome] = []
+    for ms in chosen:
+        for snap, hours in _highlight_outcomes(ms):
+            highlights.append(HighlightedOutcome(market=ms, outcome=snap, hours_to_end=hours))
+
+    return FilterResult(
+        total_markets=len(mkts_raw),
+        candidates=market_list,
+        chosen=chosen,
+        rejected=rejects,
+        highlights=highlights,
+    )
+
+
 def _print_highlighted(highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]]) -> None:
     if not highlights:
         print(f"[INFO] 当前无满足（{_highlight_label()}）条件的选项。")
@@ -635,59 +726,44 @@ def main():
         return
 
     # ---------- 非流式模式（批量） ----------
-    market_list: List[MarketSnapshot] = []
-    early_rejects: List[Tuple[MarketSnapshot, str]] = []
-
-    for raw in mkts_raw:
-        title = (raw.get("question") or raw.get("title") or "")
-        slug  = (raw.get("slug") or "")
-        if only_pat and (only_pat not in title.lower() and only_pat not in slug.lower()):
-            continue
-        ms = _parse_market(raw)
-        ok, reason = _early_filter_reason(ms, args.min_end_hours, args.legacy_end_days)
-        if ok:
-            market_list.append(ms)
-        else:
-            early_rejects.append((ms, reason))
-
-    if not args.skip_orderbook and market_list and (not args.no_rest_backfill):
-        _rest_books_backfill(market_list, batch_size=args.books_batch_size)
-
-    chosen: List[MarketSnapshot] = []
-    rejects: List[Tuple[MarketSnapshot, str]] = early_rejects.copy()
-    for ms in market_list:
-        ok, reason = _final_pass_reason(ms, require_quotes=(not args.allow_illiquid))
-        if ok:
-            chosen.append(ms)
-        else:
-            rejects.append((ms, reason))
+    result = collect_filter_results(
+        min_end_hours=args.min_end_hours,
+        max_end_days=args.max_end_days,
+        gamma_window_days=args.gamma_window_days,
+        legacy_end_days=args.legacy_end_days,
+        allow_illiquid=args.allow_illiquid,
+        skip_orderbook=args.skip_orderbook,
+        no_rest_backfill=args.no_rest_backfill,
+        books_batch_size=args.books_batch_size,
+        only=args.only,
+        prefetched_markets=mkts_raw,
+    )
 
     if args.diagnose:
         shown = 0
-        for i, (ms, reason) in enumerate(rejects[:args.diagnose_samples], start=1):
-            _print_snapshot(i, len(rejects), ms)
+        for i, (ms, reason) in enumerate(result.rejected[:args.diagnose_samples], start=1):
+            _print_snapshot(i, len(result.rejected), ms)
             print(f"[TRACE]   -> 结果：{reason}。")
             print(f"[TRACE]   --------------------------------------------------")
             shown += 1
-        if chosen:
+        if result.chosen:
             print("[INFO] （通过样本，最多显示 10 个）")
-            for k, ms in enumerate(chosen[:10], start=1):
+            for k, ms in enumerate(result.chosen[:10], start=1):
                 yb = "-" if ms.yes.bid is None else f"{ms.yes.bid:.4f}"
                 ya = "-" if ms.yes.ask is None else f"{ms.yes.ask:.4f}"
                 nb = "-" if ms.no.bid is None else f"{ms.no.bid:.4f}"
                 na = "-" if ms.no.ask is None else f"{ms.no.ask:.4f}"
                 print(f"  [{k}] {ms.slug} | YES bid/ask={yb}/{ya} | NO bid/ask={nb}/{na} | LQ={_fmt_money(ms.liquidity)} Vol={_fmt_money(ms.totalVolume)}")
 
-    highlights: List[Tuple[MarketSnapshot, OutcomeSnapshot, float]] = []
-    for ms in chosen:
-        for snap, hours in _highlight_outcomes(ms):
-            highlights.append((ms, snap, hours))
+    printable_highlights = [
+        (ho.market, ho.outcome, ho.hours_to_end) for ho in result.highlights
+    ]
 
     print("")
-    _print_highlighted(highlights)
+    _print_highlighted(printable_highlights)
 
     print("")
-    print(f"[INFO] 通过筛选的市场数量：{len(chosen)} / {len(mkts_raw)}")
+    print(f"[INFO] 通过筛选的市场数量：{len(result.chosen)} / {result.total_markets}")
 
 if __name__ == "__main__":
     main()
