@@ -35,6 +35,7 @@ from urllib import error, parse, request
 from Volatility_arbitrage_main_rest_EOA import get_client as get_eoa_client
 from Volatility_arbitrage_main_rest_EOA import get_api_creds_tuple
 from Volatility_arbitrage_price_watch_EOA import resolve_token_ids
+from trading import fetch_orderbook_quotes
 
 DEFAULT_BANNED_KEYWORDS: Tuple[str, ...] = (
     "Bitcoin",
@@ -103,27 +104,7 @@ USER_AGENT = (
     "Chrome/123.0.0.0 Safari/537.36"
 )
 
-_ORDERBOOK_CACHE: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-_ORDERBOOK_METHOD_CANDIDATES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("get_market_orderbook", ("market",)),
-    ("get_market_orderbook", ("token_id",)),
-    ("get_market_orderbook", ("market_id",)),
-    ("get_order_book", ("market",)),
-    ("get_order_book", ("token_id",)),
-    ("get_order_book", ("market_id",)),
-    ("get_orderbook", ("market",)),
-    ("get_orderbook", ("token_id",)),
-    ("get_orderbook", ("market_id",)),
-    ("get_market", ("market",)),
-    ("get_market", ("token_id",)),
-    ("get_market", ("market_id",)),
-    ("get_market_data", ("market",)),
-    ("get_market_data", ("token_id",)),
-    ("get_market_data", ("market_id",)),
-    ("get_ticker", ("market",)),
-    ("get_ticker", ("token_id",)),
-    ("get_ticker", ("market_id",)),
-)
+_ORDERBOOK_CACHE: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]] = {}
 
 
 _API_KEY_FIELDS = ("key", "apiKey", "api_key", "id", "apiId", "api_id")
@@ -325,6 +306,67 @@ def _coerce_sequence(value: Any) -> List[Any]:
     return []
 
 
+def _combine_quote_values(
+    existing: Optional[Tuple[Optional[float], Optional[float], Optional[float]]],
+    incoming: Tuple[Optional[float], Optional[float], Optional[float]],
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    base = existing or (None, None, None)
+    bid_new, ask_new, last_new = incoming
+    bid_old, ask_old, last_old = base
+    bid = bid_new if bid_new is not None else bid_old
+    ask = ask_new if ask_new is not None else ask_old
+    last = last_new if last_new is not None else last_old
+    return bid, ask, last
+
+
+def _ensure_market_mapping(market: Any) -> Optional[MappingABC]:
+    if isinstance(market, MappingABC):
+        return market
+    if isinstance(market, MarketSnapshot):
+        return _ensure_market_mapping(market.raw)
+    if isinstance(market, (list, tuple)):
+        for item in market:
+            candidate = _ensure_market_mapping(item)
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def _extract_market_identifiers(market: Any) -> Dict[str, Optional[str]]:
+    mapping = _ensure_market_mapping(market)
+    if mapping is None:
+        return {"slug": None, "market_id": None}
+
+    slug = None
+    for key in ("slug", "marketSlug", "market_slug"):
+        value = mapping.get(key)
+        if value:
+            slug = str(value)
+            break
+
+    market_id = None
+    for key in ("marketId", "market_id", "id"):
+        value = mapping.get(key)
+        if value:
+            market_id = str(value)
+            break
+
+    return {"slug": slug, "market_id": market_id}
+
+
+def _apply_quotes_to_outcome(
+    outcome: OutcomeSnapshot,
+    quotes: Tuple[Optional[float], Optional[float], Optional[float]],
+) -> None:
+    bid, ask, last = quotes
+    if outcome.best_bid is None and bid is not None:
+        outcome.best_bid = bid
+    if outcome.best_ask is None and ask is not None:
+        outcome.best_ask = ask
+    if outcome.last_price is None and last is not None:
+        outcome.last_price = last
+
+
 def _coerce_bool(value: Any) -> Optional[bool]:
     if isinstance(value, bool):
         return value
@@ -340,20 +382,6 @@ def _coerce_bool(value: Any) -> Optional[bool]:
         if lowered in {"false", "no", "n", "0", "closed", "inactive"}:
             return False
     return None
-
-
-def _ensure_sequence(raw: Any) -> Tuple[Any, ...]:
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            return tuple()
-        if isinstance(parsed, (list, tuple)):
-            return tuple(parsed)
-        return tuple()
-    if isinstance(raw, (list, tuple)):
-        return tuple(raw)
-    return tuple()
 
 
 _TIMESTAMP_KEYS = (
@@ -715,8 +743,6 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
     if {"yes", "no"} <= outcomes.keys():
         return outcomes
 
-    _apply_price_fallbacks_from_market(market, outcomes)
-
     # Fallback：根据 clobTokenIds 补齐 token 信息
     token_ids = market.get("clobTokenIds") or market.get("clobTokens")
     if isinstance(token_ids, (list, tuple)):
@@ -780,11 +806,86 @@ def _extract_price_entry(payload: Any, *, side: str) -> Optional[float]:
     return _coerce_float(payload)
 
 
-def _apply_price_fallbacks_from_market(snapshot: MarketSnapshot, market: MappingABC) -> None:
+def _fetch_quotes_via_trading(
+    snapshot: MarketSnapshot,
+    market: Any,
+    *,
+    token_filter: Optional[Sequence[str]] = None,
+) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    try:
+        client = get_eoa_client()
+    except Exception as exc:
+        print(f"[WARN] 无法获取 EOA client：{exc}")
+        return {}
+
+    identifiers = _extract_market_identifiers(market)
+    slug = identifiers.get("slug") or (snapshot.slug if snapshot.slug else None)
+    market_id = identifiers.get("market_id")
+
+    targets = {str(token) for token in token_filter} if token_filter else None
+    results: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]] = {}
+
+    for outcome in snapshot.outcomes.values():
+        token_id = outcome.token_id
+        if not token_id:
+            continue
+        token_text = str(token_id)
+        if targets is not None and token_text not in targets:
+            continue
+        try:
+            bid, ask, last = fetch_orderbook_quotes(
+                client,
+                token_id=token_text,
+                market=slug,
+                market_id=market_id,
+                slug=slug,
+            )
+        except Exception as exc:
+            print(f"[WARN] 交易接口获取报价失败：{exc}")
+            continue
+        if bid is not None or ask is not None or last is not None:
+            results[token_text] = (bid, ask, last)
+
+    return results
+
+
+def _apply_price_fallbacks_from_market(snapshot: MarketSnapshot, market: Any) -> None:
+    market_mapping = _ensure_market_mapping(market)
+    if market_mapping is None:
+        return
+
+    token_map = {
+        str(outcome.token_id): outcome
+        for outcome in snapshot.outcomes.values()
+        if outcome.token_id
+    }
+
+    pending_tokens = [
+        token_id
+        for token_id, outcome in token_map.items()
+        if outcome.best_bid is None
+        or outcome.best_ask is None
+        or outcome.last_price is None
+    ]
+    if pending_tokens:
+        trading_quotes = _fetch_quotes_via_trading(
+            snapshot, market_mapping, token_filter=pending_tokens
+        )
+        for token_id, quotes in trading_quotes.items():
+            outcome = token_map.get(token_id)
+            if not outcome:
+                continue
+            _apply_quotes_to_outcome(outcome, quotes)
+            _ORDERBOOK_CACHE[token_id] = _combine_quote_values(
+                _ORDERBOOK_CACHE.get(token_id), quotes
+            )
+
     index_map = {"yes": 0, "no": 1}
-    best_bids_seq = _coerce_sequence(market.get("bestBids"))
-    best_asks_seq = _coerce_sequence(market.get("bestAsks"))
-    outcome_prices_seq = _coerce_sequence(market.get("outcomePrices") or market.get("outcomeTokenPrices"))
+    best_bids_seq = _coerce_sequence(market_mapping.get("bestBids"))
+    best_asks_seq = _coerce_sequence(market_mapping.get("bestAsks"))
+    outcome_prices_seq = _coerce_sequence(
+        market_mapping.get("outcomePrices") or market_mapping.get("outcomeTokenPrices")
+    )
 
     for side, idx in index_map.items():
         outcome = snapshot.outcomes.get(side)
@@ -804,7 +905,9 @@ def _apply_price_fallbacks_from_market(snapshot: MarketSnapshot, market: Mapping
                 outcome.last_price = price
 
 
-def _parse_price_change_for_quotes(pc: MappingABC) -> Tuple[Optional[float], Optional[float]]:
+def _parse_price_change_for_quotes(
+    pc: MappingABC,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     def _to_float(val: Any) -> Optional[float]:
         if val is None:
             return None
@@ -849,10 +952,30 @@ def _parse_price_change_for_quotes(pc: MappingABC) -> Tuple[Optional[float], Opt
             if best_ask is not None:
                 break
 
-    return best_bid, best_ask
+    last_fields = (
+        "last_price",
+        "lastPrice",
+        "price",
+        "trade_price",
+        "tradePrice",
+        "last_trade_price",
+        "lastTradePrice",
+        "markPrice",
+        "close",
+    )
+    last_price: Optional[float] = None
+    for key in last_fields:
+        if key in pc:
+            last_price = _to_float(pc.get(key))
+            if last_price is not None:
+                break
+
+    return best_bid, best_ask, last_price
 
 
-def _fetch_quotes_via_ws(token_ids: Sequence[str], timeout: float = 3.0) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+def _fetch_quotes_via_ws(
+    token_ids: Sequence[str], timeout: float = 3.0
+) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
     tokens = [str(tid) for tid in token_ids if tid]
     if not tokens:
         return {}
@@ -864,7 +987,7 @@ def _fetch_quotes_via_ws(token_ids: Sequence[str], timeout: float = 3.0) -> Dict
         return {}
 
     needed = set(tokens)
-    results: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    results: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]] = {}
     lock = threading.Lock()
     stop_event = threading.Event()
     done = threading.Event()
@@ -885,11 +1008,13 @@ def _fetch_quotes_via_ws(token_ids: Sequence[str], timeout: float = 3.0) -> Dict
             token_id = str(pc.get("token_id") or pc.get("tokenId") or pc.get("id") or "")
             if token_id not in needed:
                 continue
-            bid, ask = _parse_price_change_for_quotes(pc)
-            if bid is None and ask is None:
+            bid, ask, last = _parse_price_change_for_quotes(pc)
+            if bid is None and ask is None and last is None:
                 continue
             with lock:
-                results[token_id] = (bid, ask)
+                existing = results.get(token_id)
+                merged = _combine_quote_values(existing, (bid, ask, last))
+                results[token_id] = merged
                 if needed.issubset(results.keys()):
                     done.set()
                     stop_event.set()
@@ -915,34 +1040,66 @@ def _fetch_quotes_via_ws(token_ids: Sequence[str], timeout: float = 3.0) -> Dict
     return results
 
 
-def _maybe_backfill_quotes(snapshot: MarketSnapshot) -> None:
-    targets: List[str] = []
-    for outcome in (snapshot.yes, snapshot.no):
-        if not outcome or not outcome.token_id:
-            continue
-        if outcome.best_bid is not None and outcome.best_ask is not None:
-            continue
-        if _ORDERBOOK_CACHE.get(outcome.token_id) is None:
-            targets.append(outcome.token_id)
+def _maybe_backfill_quotes(snapshot: MarketSnapshot, market: Any) -> None:
+    market_mapping = _ensure_market_mapping(market)
 
-    fetched: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-    if targets:
-        fetched = _fetch_quotes_via_ws(targets)
-        for token_id, pair in fetched.items():
-            _ORDERBOOK_CACHE[token_id] = pair
+    token_to_outcome = {
+        str(outcome.token_id): outcome
+        for outcome in snapshot.outcomes.values()
+        if outcome and outcome.token_id
+    }
+    if not token_to_outcome:
+        return
 
-    for outcome in (snapshot.yes, snapshot.no):
-        if not outcome or not outcome.token_id:
+    if market_mapping is None:
+        market_mapping = _ensure_market_mapping(snapshot.raw)
+
+    pending: List[str] = []
+    for token_id, outcome in token_to_outcome.items():
+        cached = _ORDERBOOK_CACHE.get(token_id)
+        if cached:
+            _apply_quotes_to_outcome(outcome, cached)
+        if (
+            outcome.best_bid is None
+            or outcome.best_ask is None
+            or outcome.last_price is None
+        ):
+            pending.append(token_id)
+
+    if not pending:
+        return
+
+    trading_quotes = _fetch_quotes_via_trading(
+        snapshot, market_mapping or market, token_filter=pending
+    )
+    remaining: List[str] = []
+    for token_id in pending:
+        outcome = token_to_outcome[token_id]
+        quotes = trading_quotes.get(token_id)
+        if quotes:
+            _apply_quotes_to_outcome(outcome, quotes)
+            _ORDERBOOK_CACHE[token_id] = _combine_quote_values(
+                _ORDERBOOK_CACHE.get(token_id), quotes
+            )
+        if (
+            outcome.best_bid is None
+            or outcome.best_ask is None
+            or outcome.last_price is None
+        ):
+            remaining.append(token_id)
+
+    if not remaining:
+        return
+
+    ws_quotes = _fetch_quotes_via_ws(remaining)
+    for token_id, quotes in ws_quotes.items():
+        outcome = token_to_outcome.get(token_id)
+        if not outcome:
             continue
-        bid, ask = _ORDERBOOK_CACHE.get(outcome.token_id, (None, None))
-        if bid is None or ask is None:
-            fetched_pair = fetched.get(outcome.token_id)
-            if fetched_pair:
-                bid, ask = fetched_pair
-        if outcome.best_bid is None and bid is not None:
-            outcome.best_bid = bid
-        if outcome.best_ask is None and ask is not None:
-            outcome.best_ask = ask
+        _apply_quotes_to_outcome(outcome, quotes)
+        _ORDERBOOK_CACHE[token_id] = _combine_quote_values(
+            _ORDERBOOK_CACHE.get(token_id), quotes
+        )
 
 
 def _extract_tags(market: Dict[str, Any]) -> Tuple[str, ...]:
@@ -1282,10 +1439,12 @@ def _format_trace_raw_market(index: int, total: int, market: Dict[str, Any]) -> 
     best_bids = _format_trace_sequence_display(market.get("bestBids"), numeric=True)
     best_asks = _format_trace_sequence_display(market.get("bestAsks"), numeric=True)
 
-    quotes_line = (
-        f"[TRACE]   报价：outcomePrices={outcome_prices} "
-        f"bestBids={best_bids} bestAsks={best_asks}"
-    )
+    quote_parts = [f"outcomePrices={outcome_prices}"]
+    if best_bids != "[]":
+        quote_parts.append(f"bestBids={best_bids}")
+    if best_asks != "[]":
+        quote_parts.append(f"bestAsks={best_asks}")
+    quotes_line = "[TRACE]   报价：" + " ".join(quote_parts)
 
     token_ids = market.get("clobTokenIds") or market.get("clobTokens")
     tag_values = market.get("tags") or market.get("tagNames") or market.get("categories")
@@ -1333,7 +1492,7 @@ def filter_markets(
                 print(f"[TRACE]   -> 解析失败，跳过（{exc}）。")
             continue
         if cfg.require_trading and allow_orderbook_backfill:
-            _maybe_backfill_quotes(snapshot)
+            _maybe_backfill_quotes(snapshot, market)
         passed, reason = market_passes_with_reason(snapshot, cfg)
         if trace:
             print(_format_trace_snapshot(snapshot))
