@@ -29,7 +29,7 @@ from collections.abc import Iterable as IterableABC, Mapping as MappingABC
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from urllib import error, parse, request
 
 from Volatility_arbitrage_main_rest_EOA import get_client as get_eoa_client
@@ -767,6 +767,37 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
     return outcomes
 
 
+
+def _extract_market_identifiers(
+    market: Optional[MappingABC],
+    *,
+    slug_hint: Optional[str] = None,
+    market_id_hint: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    slug = slug_hint
+    market_id = market_id_hint
+    if isinstance(market, MappingABC):
+        slug_candidates = ("slug", "marketSlug", "market_slug")
+        for key in slug_candidates:
+            value = market.get(key)
+            if value:
+                slug = str(value)
+                break
+        id_candidates = ("marketId", "market_id", "id", "marketID")
+        for key in id_candidates:
+            value = market.get(key)
+            if value:
+                market_id = str(value)
+                break
+
+    if slug is not None:
+        slug = str(slug).strip() or None
+    if market_id is not None:
+        market_id = str(market_id).strip() or None
+
+    return slug, market_id
+
+
 def _extract_price_entry(payload: Any, *, side: str) -> Optional[float]:
     if side == "bid":
         keys = ("best_bid", "bestBid", "bid", "highest_bid", "highestBid", "buy", "price")
@@ -776,11 +807,11 @@ def _extract_price_entry(payload: Any, *, side: str) -> Optional[float]:
             "bestAsk",
             "ask",
             "offer",
+            "sell",
             "best_offer",
             "bestOffer",
             "lowest_ask",
             "lowestAsk",
-            "sell",
             "price",
         )
 
@@ -936,6 +967,16 @@ def _parse_price_change_for_quotes(
         "bestOffer",
         "lowest_ask",
         "lowestAsk",
+    )
+    last_fields = (
+        "last_price",
+        "lastPrice",
+        "price",
+        "last_trade_price",
+        "lastTradePrice",
+        "mark_price",
+        "markPrice",
+        "last",
     )
 
     best_bid: Optional[float] = None
@@ -1456,7 +1497,11 @@ def _format_trace_raw_market(index: int, total: int, market: Dict[str, Any]) -> 
     end_raw = next((market.get(key) for key in _TIMESTAMP_KEYS if market.get(key) is not None), None)
     time_line = f"[TRACE]   时间：raw_end={end_raw or '-'}"
 
-    return "\n".join((status_line, price_line, quotes_line, misc_line, time_line))
+    lines = [status_line, price_line]
+    if quotes_line:
+        lines.append(quotes_line)
+    lines.extend([misc_line, time_line])
+    return "\n".join(lines)
 
 
 def _format_trace_snapshot(snapshot: MarketSnapshot) -> str:
