@@ -127,6 +127,11 @@ _ORDERBOOK_METHOD_CANDIDATES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 )
 
 
+_WS_TIMEOUT_DEFAULT = 3.0
+_WS_TIMEOUT = _WS_TIMEOUT_DEFAULT
+_ALLOW_REST_BACKFILL = True
+
+
 _API_KEY_FIELDS = ("key", "apiKey", "api_key", "id", "apiId", "api_id")
 _API_SECRET_FIELDS = ("secret", "apiSecret", "api_secret", "apiSecretKey")
 _API_PASS_FIELDS = (
@@ -1160,7 +1165,7 @@ def _parse_price_change_for_quotes(
 
 
 def _fetch_quotes_via_ws(
-    token_ids: Sequence[str], timeout: float = 3.0
+    token_ids: Sequence[str], timeout: float = _WS_TIMEOUT_DEFAULT
 ) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
     tokens = [str(tid) for tid in token_ids if tid]
     if not tokens:
@@ -1221,28 +1226,54 @@ def _fetch_quotes_via_ws(
     stop_event.set()
     thread.join(timeout=1.0)
 
+    remaining = needed.difference(results.keys())
+    if remaining:
+        formatted = ", ".join(sorted(remaining))
+        print(f"[HINT] WS 超时/空簿：token_id={formatted}")
+
     return results
 
 
 def _maybe_backfill_quotes(snapshot: MarketSnapshot) -> None:
     ws_targets: List[str] = []
-    for outcome in (snapshot.yes, snapshot.no):
+    outcomes = [snapshot.yes, snapshot.no]
+
+    for outcome in outcomes:
         if not outcome or not outcome.token_id:
             continue
 
-        bid: Optional[float]
-        ask: Optional[float]
-        last: Optional[float]
         cached = _ORDERBOOK_CACHE.get(outcome.token_id)
         if cached is not None:
             bid, ask, last = cached
-        else:
-            bid, ask, last = _fetch_quotes_via_trading(
-                outcome.token_id,
-                slug=snapshot.slug,
-            )
-            if bid is not None or ask is not None or last is not None:
-                _ORDERBOOK_CACHE[outcome.token_id] = (bid, ask, last)
+            if outcome.best_bid is None and bid is not None:
+                outcome.best_bid = bid
+            if outcome.best_ask is None and ask is not None:
+                outcome.best_ask = ask
+            if outcome.last_price is None and last is not None:
+                outcome.last_price = last
+
+        needs_ws = (
+            outcome.best_bid is None
+            or outcome.best_ask is None
+            or outcome.last_price is None
+        )
+        if needs_ws and outcome.token_id not in ws_targets:
+            ws_targets.append(outcome.token_id)
+
+    fetched_ws: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]] = {}
+    if ws_targets:
+        fetched_ws = _fetch_quotes_via_ws(ws_targets, timeout=_WS_TIMEOUT)
+        for token_id, triple in fetched_ws.items():
+            _ORDERBOOK_CACHE[token_id] = triple
+
+    rest_targets: List[str] = []
+    for outcome in outcomes:
+        if not outcome or not outcome.token_id:
+            continue
+
+        bid, ask, last = _ORDERBOOK_CACHE.get(outcome.token_id, (None, None, None))
+        if outcome.token_id in fetched_ws:
+            bid, ask, last = fetched_ws.get(outcome.token_id, (bid, ask, last))
 
         if outcome.best_bid is None and bid is not None:
             outcome.best_bid = bid
@@ -1251,22 +1282,29 @@ def _maybe_backfill_quotes(snapshot: MarketSnapshot) -> None:
         if outcome.last_price is None and last is not None:
             outcome.last_price = last
 
-        if (outcome.best_bid is None or outcome.best_ask is None) and outcome.token_id:
-            if outcome.token_id not in ws_targets:
-                ws_targets.append(outcome.token_id)
+        still_missing = (
+            (outcome.best_bid is None or outcome.best_ask is None or outcome.last_price is None)
+            and outcome.token_id not in rest_targets
+        )
+        if still_missing:
+            rest_targets.append(outcome.token_id)
 
-    fetched_ws: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]] = {}
-    if ws_targets:
-        fetched_ws = _fetch_quotes_via_ws(ws_targets)
-        for token_id, triple in fetched_ws.items():
-            _ORDERBOOK_CACHE[token_id] = triple
+    if not _ALLOW_REST_BACKFILL or not rest_targets:
+        return
 
-    for outcome in (snapshot.yes, snapshot.no):
+    for token_id in rest_targets:
+        bid, ask, last = _fetch_quotes_via_trading(
+            token_id,
+            market=snapshot.raw,
+            slug=snapshot.slug,
+        )
+        if bid is not None or ask is not None or last is not None:
+            _ORDERBOOK_CACHE[token_id] = (bid, ask, last)
+
+    for outcome in outcomes:
         if not outcome or not outcome.token_id:
             continue
         bid, ask, last = _ORDERBOOK_CACHE.get(outcome.token_id, (None, None, None))
-        if (bid is None or ask is None or last is None) and outcome.token_id in fetched_ws:
-            bid, ask, last = fetched_ws.get(outcome.token_id, (bid, ask, last))
         if outcome.best_bid is None and bid is not None:
             outcome.best_bid = bid
         if outcome.best_ask is None and ask is not None:
@@ -1376,9 +1414,42 @@ def _keyword_hit(text: str, keywords: Sequence[str]) -> bool:
     return False
 
 
+def _is_legacy_or_archived_market(snapshot: MarketSnapshot) -> bool:
+    raw = snapshot.raw or {}
+    clob_tokens = raw.get("clobTokenIds") or raw.get("clobTokens")
+
+    title = (snapshot.title or "").strip()
+    slug = (snapshot.slug or "").strip()
+    title_upper = title.upper()
+    slug_lower = slug.lower()
+
+    if title_upper.startswith("ARCH ") or title_upper.startswith("ARCH:"):
+        return True
+    if slug_lower.startswith("arch-") or slug_lower.startswith("arch_"):
+        return True
+
+    if not clob_tokens and (snapshot.yes is None or snapshot.no is None):
+        return True
+
+    if snapshot.hours_to_end is not None and snapshot.hours_to_end < 0:
+        accepting_orders = raw.get("acceptingOrders")
+        status_incomplete = (
+            snapshot.is_active is None
+            or snapshot.is_closed is None
+            or accepting_orders is None
+        )
+        if status_incomplete:
+            return True
+
+    return False
+
+
 def market_passes_with_reason(
     snapshot: MarketSnapshot, cfg: MarketFilterConfig
 ) -> Tuple[bool, str]:
+    if _is_legacy_or_archived_market(snapshot):
+        return False, "归档/旧格式（非 CLOB）"
+
     if cfg.require_binary and ({"yes", "no"} - set(snapshot.outcomes.keys())):
         return False, "非二元市场"
 
@@ -1780,6 +1851,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--allow-illiquid", action="store_true", help="允许无买卖报价的市场")
     parser.add_argument("--allow-paused", action="store_true", help="允许 acceptingOrders=False 的市场")
     parser.add_argument("--skip-orderbook", action="store_true", help="跳过订单簿补全报价，加速诊断")
+    parser.add_argument(
+        "--ws-timeout",
+        type=float,
+        default=_WS_TIMEOUT_DEFAULT,
+        help="WS 补价等待秒数（默认 3s，可适当上调应对冷门盘）",
+    )
+    parser.add_argument(
+        "--no-rest-backfill",
+        action="store_true",
+        help="仅使用 WS 补价，禁用 REST 兜底",
+    )
 
     parser.add_argument("--exclude", nargs="*", help="标题包含任意关键字则剔除")
     parser.add_argument("--only", nargs="*", help="标题需包含任意关键字方可保留")
@@ -1802,6 +1884,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    global _WS_TIMEOUT, _ALLOW_REST_BACKFILL
+    _WS_TIMEOUT = max(args.ws_timeout, 0.1) if args.ws_timeout is not None else _WS_TIMEOUT_DEFAULT
+    _ALLOW_REST_BACKFILL = not args.no_rest_backfill
 
     cfg = _cli_build_config(args)
     diagnostics = FilterDiagnostics(sample_limit=args.diagnose_samples) if args.diagnose else None
