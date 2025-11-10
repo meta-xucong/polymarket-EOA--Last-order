@@ -319,17 +319,34 @@ def _combine_quote_values(
     return bid, ask, last
 
 
-def _extract_market_identifiers(market: MappingABC) -> Dict[str, Optional[str]]:
+def _ensure_market_mapping(market: Any) -> Optional[MappingABC]:
+    if isinstance(market, MappingABC):
+        return market
+    if isinstance(market, MarketSnapshot):
+        return _ensure_market_mapping(market.raw)
+    if isinstance(market, (list, tuple)):
+        for item in market:
+            candidate = _ensure_market_mapping(item)
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def _extract_market_identifiers(market: Any) -> Dict[str, Optional[str]]:
+    mapping = _ensure_market_mapping(market)
+    if mapping is None:
+        return {"slug": None, "market_id": None}
+
     slug = None
     for key in ("slug", "marketSlug", "market_slug"):
-        value = market.get(key)
+        value = mapping.get(key)
         if value:
             slug = str(value)
             break
 
     market_id = None
     for key in ("marketId", "market_id", "id"):
-        value = market.get(key)
+        value = mapping.get(key)
         if value:
             market_id = str(value)
             break
@@ -822,7 +839,7 @@ def _extract_price_entry(payload: Any, *, side: str) -> Optional[float]:
 
 def _fetch_quotes_via_trading(
     snapshot: MarketSnapshot,
-    market: MappingABC,
+    market: Any,
     *,
     token_filter: Optional[Sequence[str]] = None,
 ) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
@@ -863,7 +880,11 @@ def _fetch_quotes_via_trading(
     return results
 
 
-def _apply_price_fallbacks_from_market(snapshot: MarketSnapshot, market: MappingABC) -> None:
+def _apply_price_fallbacks_from_market(snapshot: MarketSnapshot, market: Any) -> None:
+    market_mapping = _ensure_market_mapping(market)
+    if market_mapping is None:
+        return
+
     token_map = {
         str(outcome.token_id): outcome
         for outcome in snapshot.outcomes.values()
@@ -879,7 +900,7 @@ def _apply_price_fallbacks_from_market(snapshot: MarketSnapshot, market: Mapping
     ]
     if pending_tokens:
         trading_quotes = _fetch_quotes_via_trading(
-            snapshot, market, token_filter=pending_tokens
+            snapshot, market_mapping, token_filter=pending_tokens
         )
         for token_id, quotes in trading_quotes.items():
             outcome = token_map.get(token_id)
@@ -891,9 +912,11 @@ def _apply_price_fallbacks_from_market(snapshot: MarketSnapshot, market: Mapping
             )
 
     index_map = {"yes": 0, "no": 1}
-    best_bids_seq = _coerce_sequence(market.get("bestBids"))
-    best_asks_seq = _coerce_sequence(market.get("bestAsks"))
-    outcome_prices_seq = _coerce_sequence(market.get("outcomePrices") or market.get("outcomeTokenPrices"))
+    best_bids_seq = _coerce_sequence(market_mapping.get("bestBids"))
+    best_asks_seq = _coerce_sequence(market_mapping.get("bestAsks"))
+    outcome_prices_seq = _coerce_sequence(
+        market_mapping.get("outcomePrices") or market_mapping.get("outcomeTokenPrices")
+    )
 
     for side, idx in index_map.items():
         outcome = snapshot.outcomes.get(side)
@@ -1058,7 +1081,9 @@ def _fetch_quotes_via_ws(
     return results
 
 
-def _maybe_backfill_quotes(snapshot: MarketSnapshot, market: MappingABC) -> None:
+def _maybe_backfill_quotes(snapshot: MarketSnapshot, market: Any) -> None:
+    market_mapping = _ensure_market_mapping(market)
+
     token_to_outcome = {
         str(outcome.token_id): outcome
         for outcome in snapshot.outcomes.values()
@@ -1066,6 +1091,9 @@ def _maybe_backfill_quotes(snapshot: MarketSnapshot, market: MappingABC) -> None
     }
     if not token_to_outcome:
         return
+
+    if market_mapping is None:
+        market_mapping = _ensure_market_mapping(snapshot.raw)
 
     pending: List[str] = []
     for token_id, outcome in token_to_outcome.items():
@@ -1083,7 +1111,7 @@ def _maybe_backfill_quotes(snapshot: MarketSnapshot, market: MappingABC) -> None
         return
 
     trading_quotes = _fetch_quotes_via_trading(
-        snapshot, market, token_filter=pending
+        snapshot, market_mapping or market, token_filter=pending
     )
     remaining: List[str] = []
     for token_id in pending:
