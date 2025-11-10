@@ -23,6 +23,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from collections.abc import Iterable as IterableABC, Mapping as MappingABC
 from dataclasses import dataclass, field
@@ -303,6 +304,25 @@ def _coerce_float(value: Any) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+def _coerce_sequence(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        value = parsed
+    if isinstance(value, MappingABC):
+        return list(value.values())
+    if isinstance(value, IterableABC) and not isinstance(value, (str, bytes, bytearray)):
+        return list(value)
+    return []
 
 
 def _coerce_bool(value: Any) -> Optional[bool]:
@@ -661,19 +681,13 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
             outcome.get("bestBid")
             or outcome.get("best_bid")
             or outcome.get("bid")
-            or outcome.get("highestBid")
-            or outcome.get("highest_bid")
-            or outcome.get("bestBuy")
-            or outcome.get("buy")
+            or outcome.get("bestBidPrice")
         )
         best_ask = _coerce_float(
             outcome.get("bestAsk")
             or outcome.get("best_ask")
             or outcome.get("ask")
-            or outcome.get("lowestAsk")
-            or outcome.get("lowest_ask")
-            or outcome.get("bestSell")
-            or outcome.get("sell")
+            or outcome.get("bestAskPrice")
         )
         last_price = _coerce_float(
             outcome.get("lastPrice")
@@ -727,13 +741,11 @@ def _summarize_outcomes(market: Dict[str, Any]) -> Dict[str, OutcomeSnapshot]:
     return outcomes
 
 
-def _extract_best_ask(payload: Any) -> Optional[float]:
-    numeric = _coerce_float(payload)
-    if numeric is not None:
-        return numeric
-
-    if isinstance(payload, MappingABC):
-        primary_keys = (
+def _extract_price_entry(payload: Any, *, side: str) -> Optional[float]:
+    if side == "bid":
+        keys = ("best_bid", "bestBid", "bid", "highest_bid", "highestBid", "buy", "price")
+    else:
+        keys = (
             "best_ask",
             "bestAsk",
             "ask",
@@ -743,176 +755,193 @@ def _extract_best_ask(payload: Any) -> Optional[float]:
             "lowest_ask",
             "lowestAsk",
             "sell",
+            "price",
         )
-        ladder_keys = (
-            "asks",
-            "ask_levels",
-            "sell_orders",
-            "sellOrders",
-            "offers",
-        )
-
-        for key in primary_keys:
-            if key in payload:
-                extracted = _extract_best_ask(payload[key])
-                if extracted is not None:
-                    return extracted
-
-        for key in ladder_keys:
-            if key in payload:
-                ladder = payload[key]
-                if isinstance(ladder, IterableABC) and not isinstance(ladder, (str, bytes, bytearray)):
-                    for entry in ladder:
-                        if isinstance(entry, MappingABC) and "price" in entry:
-                            candidate = _coerce_float(entry["price"])
-                            if candidate is not None:
-                                return candidate
-                        extracted = _extract_best_ask(entry)
-                        if extracted is not None:
-                            return extracted
-
-        for value in payload.values():
-            extracted = _extract_best_ask(value)
-            if extracted is not None:
-                return extracted
-        return None
-
-    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
-        for item in payload:
-            extracted = _extract_best_ask(item)
-            if extracted is not None:
-                return extracted
-        return None
-
-    return None
-
-
-def _extract_best_bid(payload: Any) -> Optional[float]:
-    numeric = _coerce_float(payload)
-    if numeric is not None:
-        return numeric
 
     if isinstance(payload, MappingABC):
-        primary_keys = (
-            "best_bid",
-            "bestBid",
-            "bid",
-            "best_buy",
-            "bestBuy",
-            "highest_bid",
-            "highestBid",
-            "buy",
-        )
-        ladder_keys = (
-            "bids",
-            "bid_levels",
-            "buy_orders",
-            "buyOrders",
-        )
-
-        for key in primary_keys:
+        for key in keys:
             if key in payload:
-                extracted = _extract_best_bid(payload[key])
-                if extracted is not None:
-                    return extracted
-
-        for key in ladder_keys:
-            if key in payload:
-                ladder = payload[key]
-                if isinstance(ladder, IterableABC) and not isinstance(ladder, (str, bytes, bytearray)):
-                    for entry in ladder:
-                        if isinstance(entry, MappingABC) and "price" in entry:
-                            candidate = _coerce_float(entry["price"])
-                            if candidate is not None:
-                                return candidate
-                        extracted = _extract_best_bid(entry)
-                        if extracted is not None:
-                            return extracted
-
+                candidate = _extract_price_entry(payload.get(key), side=side)
+                if candidate is not None:
+                    return candidate
         for value in payload.values():
-            extracted = _extract_best_bid(value)
-            if extracted is not None:
-                return extracted
+            candidate = _extract_price_entry(value, side=side)
+            if candidate is not None:
+                return candidate
         return None
 
     if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
-            extracted = _extract_best_bid(item)
-            if extracted is not None:
-                return extracted
+            candidate = _extract_price_entry(item, side=side)
+            if candidate is not None:
+                return candidate
         return None
 
-    return None
+    return _coerce_float(payload)
 
 
-def _fetch_best_quotes(client: Any, token_id: str) -> Tuple[Optional[float], Optional[float]]:
-    method_candidates = (
-        ("get_market_orderbook", {"market": token_id}),
-        ("get_market_orderbook", {"token_id": token_id}),
-        ("get_market_orderbook", {"market_id": token_id}),
-        ("get_order_book", {"market": token_id}),
-        ("get_order_book", {"token_id": token_id}),
-        ("get_orderbook", {"market": token_id}),
-        ("get_orderbook", {"token_id": token_id}),
-        ("get_market", {"market": token_id}),
-        ("get_market", {"token_id": token_id}),
-        ("get_market_data", {"market": token_id}),
-        ("get_market_data", {"token_id": token_id}),
-        ("get_ticker", {"market": token_id}),
-        ("get_ticker", {"token_id": token_id}),
+def _apply_price_fallbacks_from_market(snapshot: MarketSnapshot, market: MappingABC) -> None:
+    index_map = {"yes": 0, "no": 1}
+    best_bids_seq = _coerce_sequence(market.get("bestBids"))
+    best_asks_seq = _coerce_sequence(market.get("bestAsks"))
+    outcome_prices_seq = _coerce_sequence(market.get("outcomePrices") or market.get("outcomeTokenPrices"))
+
+    for side, idx in index_map.items():
+        outcome = snapshot.outcomes.get(side)
+        if not outcome:
+            continue
+        if outcome.best_bid is None and idx < len(best_bids_seq):
+            bid = _extract_price_entry(best_bids_seq[idx], side="bid")
+            if bid is not None:
+                outcome.best_bid = bid
+        if outcome.best_ask is None and idx < len(best_asks_seq):
+            ask = _extract_price_entry(best_asks_seq[idx], side="ask")
+            if ask is not None:
+                outcome.best_ask = ask
+        if outcome.last_price is None and idx < len(outcome_prices_seq):
+            price = _extract_price_entry(outcome_prices_seq[idx], side="ask")
+            if price is not None:
+                outcome.last_price = price
+
+
+def _parse_price_change_for_quotes(pc: MappingABC) -> Tuple[Optional[float], Optional[float]]:
+    def _to_float(val: Any) -> Optional[float]:
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    bid_fields = (
+        "best_bid",
+        "bestBid",
+        "bid",
+        "best_buy",
+        "bestBuy",
+        "highest_bid",
+        "highestBid",
+        "buy",
+    )
+    ask_fields = (
+        "best_ask",
+        "bestAsk",
+        "ask",
+        "offer",
+        "sell",
+        "best_offer",
+        "bestOffer",
+        "lowest_ask",
+        "lowestAsk",
     )
 
-    for name, kwargs in method_candidates:
-        fn = getattr(client, name, None)
-        if not callable(fn):
-            continue
-        try:
-            resp = fn(**kwargs)
-        except TypeError:
-            continue
-        except Exception:
-            continue
+    best_bid: Optional[float] = None
+    for key in bid_fields:
+        if key in pc:
+            best_bid = _to_float(pc.get(key))
+            if best_bid is not None:
+                break
 
-        payload: Any = resp
-        if isinstance(resp, tuple) and len(resp) == 2:
-            payload = resp[1]
-        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
-            payload = payload.get("data")
+    best_ask: Optional[float] = None
+    for key in ask_fields:
+        if key in pc:
+            best_ask = _to_float(pc.get(key))
+            if best_ask is not None:
+                break
 
-        bid = _extract_best_bid(payload)
-        ask = _extract_best_ask(payload)
-        if bid is not None or ask is not None:
-            return bid, ask
+    return best_bid, best_ask
 
-    return None, None
+
+def _fetch_quotes_via_ws(token_ids: Sequence[str], timeout: float = 3.0) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    tokens = [str(tid) for tid in token_ids if tid]
+    if not tokens:
+        return {}
+
+    try:
+        from Volatility_arbitrage_main_ws_EOA import ws_watch_by_ids
+    except Exception as exc:
+        print(f"[WARN] 无法加载 WS 模块：{exc}")
+        return {}
+
+    needed = set(tokens)
+    results: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    lock = threading.Lock()
+    stop_event = threading.Event()
+    done = threading.Event()
+
+    def _on_event(ev: Dict[str, Any]) -> None:
+        if done.is_set():
+            return
+        if not isinstance(ev, MappingABC):
+            return
+        pcs = ()
+        if ev.get("event_type") == "price_change":
+            pcs = ev.get("price_changes") or ()
+        elif "price_changes" in ev:
+            pcs = ev.get("price_changes") or ()
+        for pc in pcs:
+            if not isinstance(pc, MappingABC):
+                continue
+            token_id = str(pc.get("token_id") or pc.get("tokenId") or pc.get("id") or "")
+            if token_id not in needed:
+                continue
+            bid, ask = _parse_price_change_for_quotes(pc)
+            if bid is None and ask is None:
+                continue
+            with lock:
+                results[token_id] = (bid, ask)
+                if needed.issubset(results.keys()):
+                    done.set()
+                    stop_event.set()
+                    return
+
+    thread = threading.Thread(
+        target=ws_watch_by_ids,
+        kwargs={
+            "asset_ids": tokens,
+            "label": "vol-filter-backfill",
+            "on_event": _on_event,
+            "verbose": False,
+            "stop_event": stop_event,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    done.wait(timeout)
+    stop_event.set()
+    thread.join(timeout=1.0)
+
+    return results
 
 
 def _maybe_backfill_quotes(snapshot: MarketSnapshot) -> None:
-    try:
-        client = get_eoa_client()
-    except Exception as exc:
-        print(f"[WARN] 无法获取 EOA client：{exc}")
-        return
+    targets: List[str] = []
+    for outcome in (snapshot.yes, snapshot.no):
+        if not outcome or not outcome.token_id:
+            continue
+        if outcome.best_bid is not None and outcome.best_ask is not None:
+            continue
+        if _ORDERBOOK_CACHE.get(outcome.token_id) is None:
+            targets.append(outcome.token_id)
+
+    fetched: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    if targets:
+        fetched = _fetch_quotes_via_ws(targets)
+        for token_id, pair in fetched.items():
+            _ORDERBOOK_CACHE[token_id] = pair
 
     for outcome in (snapshot.yes, snapshot.no):
         if not outcome or not outcome.token_id:
             continue
-        need_bid = outcome.best_bid is None
-        need_ask = outcome.best_ask is None
-        if not (need_bid or need_ask):
-            continue
-
-        cached = _ORDERBOOK_CACHE.get(outcome.token_id)
-        if cached is not None:
-            bid, ask = cached
-        else:
-            bid, ask = _fetch_best_quotes(client, outcome.token_id)
-            if bid is not None or ask is not None:
-                _ORDERBOOK_CACHE[outcome.token_id] = (bid, ask)
-
-        if need_bid and bid is not None:
+        bid, ask = _ORDERBOOK_CACHE.get(outcome.token_id, (None, None))
+        if bid is None or ask is None:
+            fetched_pair = fetched.get(outcome.token_id)
+            if fetched_pair:
+                bid, ask = fetched_pair
+        if outcome.best_bid is None and bid is not None:
             outcome.best_bid = bid
-        if need_ask and ask is not None:
+        if outcome.best_ask is None and ask is not None:
             outcome.best_ask = ask
 
 
@@ -990,7 +1019,7 @@ def build_market_snapshot(market: Dict[str, Any]) -> MarketSnapshot:
 
     tags = _extract_tags(market)
 
-    return MarketSnapshot(
+    snapshot = MarketSnapshot(
         slug=slug,
         title=title,
         event_slug=str(event_slug) if event_slug else None,
@@ -1005,6 +1034,8 @@ def build_market_snapshot(market: Dict[str, Any]) -> MarketSnapshot:
         tags=tags,
         raw=market,
     )
+    _apply_price_fallbacks_from_market(snapshot, market)
+    return snapshot
 
 
 def _keyword_hit(text: str, keywords: Sequence[str]) -> bool:
