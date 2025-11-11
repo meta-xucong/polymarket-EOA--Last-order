@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from Volatility_fliter_EOA import (
     HighlightedOutcome,
@@ -166,6 +166,95 @@ def _extract_api_creds(client) -> Optional[Dict[str, str]]:
     return None
 
 
+def _normalize_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    return text or None
+
+
+def _load_existing_positions() -> Tuple[Set[str], Set[str]]:
+    try:
+        from view_positions_EOA import _fetch_positions_eoa, _infer_wallet_address
+    except Exception as exc:
+        print(f"[WARN] 无法导入持仓查询模块，跳过持仓检查：{exc}")
+        return set(), set()
+
+    wallet = _infer_wallet_address()
+    if not wallet:
+        print("[WARN] 未能确定钱包地址，跳过持仓去重。")
+        return set(), set()
+
+    try:
+        positions = _fetch_positions_eoa(wallet)
+    except Exception as exc:
+        print(f"[WARN] 获取当前持仓失败：{exc}，将不执行去重。")
+        return set(), set()
+
+    market_slugs: Set[str] = set()
+    token_ids: Set[str] = set()
+
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+
+        for key in (
+            "marketSlug",
+            "market_slug",
+            "slug",
+            "eventSlug",
+            "event_slug",
+            "collectionSlug",
+            "collection_slug",
+        ):
+            slug = _normalize_string(pos.get(key))
+            if slug:
+                market_slugs.add(slug)
+                break
+
+        for key in (
+            "token_id",
+            "tokenId",
+            "asset",
+            "token",
+            "outcomeToken",
+            "outcome_token",
+        ):
+            token = _normalize_string(pos.get(key))
+            if token:
+                token_ids.add(token)
+                break
+
+    print(
+        f"[INFO] 已加载当前持仓：共 {len(market_slugs)} 个市场，{len(token_ids)} 个 token。"
+    )
+    return market_slugs, token_ids
+
+
+def _run_claim_workflow() -> Optional[int]:
+    try:
+        from claim_all_markets_EOA import main as claim_main
+    except Exception as exc:
+        print(f"[WARN] 无法导入 claim_all_markets_EOA：{exc}。请稍后手动执行。")
+        return None
+
+    print("[STEP] 正在执行 Claim 检查…")
+    try:
+        return claim_main([])
+    except SystemExit as exc:  # 防止内部调用 sys.exit
+        code = exc.code if isinstance(exc.code, int) else 1
+        return code
+    except Exception as exc:
+        print(f"[ERR] Claim 流程异常：{exc}")
+        return -1
+
+
 def _prompt_order_size() -> Optional[float]:
     prompt = "请输入买入份数（留空=使用市场最小下单量）："
     while True:
@@ -248,9 +337,14 @@ def main() -> None:
         f"满足严格条件 {len(highlights)} 项。"
     )
 
+    existing_market_slugs, existing_token_ids = _load_existing_positions()
+
     if not highlights:
-        print("[INFO] 当前无满足条件的市场，流程结束。")
-        print("[INFO] 本脚本不包含自动 claim，请在结算后于官网手动操作。")
+        print("[INFO] 当前无满足条件的市场。")
+        claim_code = _run_claim_workflow()
+        if claim_code is not None:
+            status = "成功" if claim_code == 0 else f"退出码 {claim_code}"
+            print(f"[INFO] Claim 流程已执行：{status}。")
         return
 
     print("[INFO] 命中列表：")
@@ -272,8 +366,17 @@ def main() -> None:
         snap = ho.outcome
         token_id = snap.token_id
         ask_price = snap.ask
+        slug = ho.market.slug if getattr(ho.market, "slug", None) else None
         if not token_id or ask_price is None:
             print(f"[SKIP] #{idx} 缺少 token_id 或卖价，跳过。")
+            continue
+
+        token_id_str = str(token_id)
+        if slug and slug in existing_market_slugs:
+            print(f"[SKIP] #{idx} 市场 {slug} 已存在持仓，跳过买入。")
+            continue
+        if token_id_str and token_id_str in existing_token_ids:
+            print(f"[SKIP] #{idx} token_id={token_id_str} 已存在持仓，跳过买入。")
             continue
 
         market_min = _infer_min_order_size(ho)
@@ -304,7 +407,16 @@ def main() -> None:
         else:
             print(f"    -> [INFO] 下单响应：{resp}")
 
-    print("[DONE] 买单流程结束，后续请等待市场结算并手动 claim。")
+        if slug:
+            existing_market_slugs.add(slug)
+        if token_id_str:
+            existing_token_ids.add(token_id_str)
+
+    claim_code = _run_claim_workflow()
+    if claim_code is not None:
+        status = "成功" if claim_code == 0 else f"退出码 {claim_code}"
+        print(f"[INFO] Claim 流程已执行：{status}。")
+    print("[DONE] 买单流程结束。")
 
 
 if __name__ == "__main__":
