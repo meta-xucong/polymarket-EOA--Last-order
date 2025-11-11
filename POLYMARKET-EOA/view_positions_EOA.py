@@ -23,7 +23,8 @@ EOA优先的 Polymarket 持仓查看脚本：
 import os
 import sys
 import json
-from typing import Optional, Dict, Any, List
+import datetime as dt
+from typing import Optional, Dict, Any, List, Set
 
 import requests
 
@@ -84,6 +85,104 @@ def _fmt_money(x: float) -> str:
     return f"{x:.2f}"
 
 
+def _now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _parse_datetime(value: Any) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return dt.datetime.fromisoformat(text)
+        except Exception:
+            return None
+    return None
+
+
+def _extract_end_time(raw: Any, visited: Optional[Set[int]] = None) -> Optional[dt.datetime]:
+    if not isinstance(raw, dict):
+        return None
+    if visited is None:
+        visited = set()
+    obj_id = id(raw)
+    if obj_id in visited:
+        return None
+    visited.add(obj_id)
+
+    for key in (
+        "conditionEndTime",
+        "condition_end_time",
+        "endTime",
+        "end_time",
+        "endDate",
+        "end_date",
+        "closeDate",
+        "close_date",
+        "expiry",
+        "expiration",
+        "expiresAt",
+        "marketEndTime",
+        "market_end_time",
+        "resolveTime",
+        "resolve_time",
+    ):
+        candidate = raw.get(key)
+        dt_value = _parse_datetime(candidate)
+        if dt_value is not None:
+            return dt_value
+
+    for nested_key in ("market", "condition", "event", "marketData", "collection"):
+        nested = raw.get(nested_key)
+        if isinstance(nested, dict):
+            nested_dt = _extract_end_time(nested, visited)
+            if nested_dt is not None:
+                return nested_dt
+
+    return None
+
+
+def _format_remaining(end_time: Optional[dt.datetime]) -> str:
+    if end_time is None:
+        return "-"
+    now = _now_utc()
+    delta = end_time - now
+    total_seconds = int(delta.total_seconds())
+    sign = 1 if total_seconds >= 0 else -1
+    total_seconds = abs(total_seconds)
+
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+
+    if sign >= 0:
+        if days > 0:
+            return f"剩余{days}天{hours}小时"
+        if hours > 0:
+            return f"剩余{hours}小时{minutes}分钟"
+        if minutes > 0:
+            return f"剩余{minutes}分钟"
+        return "剩余不到1分钟"
+    else:
+        if days > 0:
+            return f"已结束{days}天{hours}小时前"
+        if hours > 0:
+            return f"已结束{hours}小时{minutes}分钟前"
+        if minutes > 0:
+            return f"已结束{minutes}分钟前"
+        return "刚刚结束"
+
+
 def _fetch_positions_eoa(user_addr: str) -> List[Dict[str, Any]]:
     # 官方文档：GET /positions?user=<address>
     # 说明“user address (required)”，返回中字段名仍叫 proxyWallet，但值就是传入的地址
@@ -141,10 +240,19 @@ def main(argv: List[str]) -> int:
         cash_pnl = p.get("cashPnl") or 0
         percent_pnl = p.get("percentPnl") or 0
         asset = p.get("asset") or ""  # token_id
+        end_time = _extract_end_time(p)
+        if end_time is not None and end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=dt.timezone.utc)
+        if end_time is not None:
+            end_iso = end_time.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        else:
+            end_iso = "-"
+        remain_text = _format_remaining(end_time)
 
         print(f"{i:>2}. {title} | {outcome} | token_id={asset}")
         print(f"    数量={size} | 均价={_fmt_money(avg_price)} | 标记价={_fmt_money(cur_price)} | "
               f"P/L={_fmt_money(cash_pnl)} ({percent_pnl:+.2f}%)")
+        print(f"    结束时间={end_iso} | {remain_text}")
 
     return 0
 
