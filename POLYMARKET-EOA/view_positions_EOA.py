@@ -23,10 +23,12 @@ EOA优先的 Polymarket 持仓查看脚本：
 import os
 import sys
 import json
+import re
 import datetime as dt
-from typing import Optional, Dict, Any, List, Set
+from typing import Optional, Dict, Any, List, Set, Tuple
 
 import requests
+from zoneinfo import ZoneInfo
 
 DATA_API_HOST = os.environ.get("DATA_API_HOST", "https://data-api.polymarket.com").rstrip("/")
 
@@ -89,28 +91,35 @@ def _now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-def _parse_datetime(value: Any) -> Optional[dt.datetime]:
+def _parse_datetime(value: Any) -> Tuple[Optional[dt.datetime], bool]:
     if value is None:
-        return None
+        return None, False
     if isinstance(value, (int, float)):
         try:
-            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc), False
         except Exception:
-            return None
+            return None, False
     if isinstance(value, str):
         text = value.strip()
         if not text:
-            return None
+            return None, False
+        # 只有日期（无具体时刻）的情况
+        if len(text) == 10 and text[4] == "-" and text[7] == "-":
+            try:
+                date_only = dt.date.fromisoformat(text)
+                return dt.datetime.combine(date_only, dt.time.min), True
+            except ValueError:
+                return None, False
         try:
             if text.endswith("Z"):
                 text = text[:-1] + "+00:00"
-            return dt.datetime.fromisoformat(text)
+            return dt.datetime.fromisoformat(text), False
         except Exception:
-            return None
-    return None
+            return None, False
+    return None, False
 
 
-def _extract_end_time(raw: Any, visited: Optional[Set[int]] = None) -> Optional[dt.datetime]:
+def _extract_end_time(raw: Any, visited: Optional[Set[int]] = None) -> Optional[Tuple[dt.datetime, bool]]:
     if not isinstance(raw, dict):
         return None
     if visited is None:
@@ -138,9 +147,9 @@ def _extract_end_time(raw: Any, visited: Optional[Set[int]] = None) -> Optional[
         "resolve_time",
     ):
         candidate = raw.get(key)
-        dt_value = _parse_datetime(candidate)
+        dt_value, is_date_only = _parse_datetime(candidate)
         if dt_value is not None:
-            return dt_value
+            return dt_value, is_date_only
 
     for nested_key in ("market", "condition", "event", "marketData", "collection"):
         nested = raw.get(nested_key)
@@ -150,6 +159,40 @@ def _extract_end_time(raw: Any, visited: Optional[Set[int]] = None) -> Optional[
                 return nested_dt
 
     return None
+
+
+_NETFLIX_PATTERN = re.compile(r"top global netflix movie this week", re.IGNORECASE)
+
+
+def _refine_date_only_end_time(end_time: dt.datetime, title: str) -> Optional[dt.datetime]:
+    """针对特定市场（如 Netflix 周榜）尝试从标题推导具体结算时刻。"""
+    if not title:
+        return None
+    if not _NETFLIX_PATTERN.search(title):
+        return None
+
+    match = re.search(
+        r"\(((January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s+\d{4})\)",
+        title,
+    )
+    if not match:
+        return None
+
+    try:
+        target_date = dt.datetime.strptime(match.group(1), "%B %d %Y")
+    except ValueError:
+        return None
+
+    try:
+        eastern = ZoneInfo("America/New_York")
+    except Exception:
+        # 如果无法加载时区信息，就退化成固定 UTC-5
+        eastern = dt.timezone(dt.timedelta(hours=-5))
+
+    localized = target_date.replace(
+        hour=15, minute=0, second=0, microsecond=0, tzinfo=eastern
+    )
+    return localized.astimezone(dt.timezone.utc)
 
 
 def _format_remaining(end_time: Optional[dt.datetime]) -> str:
@@ -240,14 +283,32 @@ def main(argv: List[str]) -> int:
         cash_pnl = p.get("cashPnl") or 0
         percent_pnl = p.get("percentPnl") or 0
         asset = p.get("asset") or ""  # token_id
-        end_time = _extract_end_time(p)
+        end_info = _extract_end_time(p)
+        end_time: Optional[dt.datetime]
+        is_date_only = False
+        if end_info is not None:
+            end_time, is_date_only = end_info
+        else:
+            end_time = None
+
+        if end_time is not None and is_date_only:
+            refined = _refine_date_only_end_time(end_time, title)
+            if refined is not None:
+                end_time = refined
+                is_date_only = False
+
         if end_time is not None and end_time.tzinfo is None:
             end_time = end_time.replace(tzinfo=dt.timezone.utc)
-        if end_time is not None:
+
+        if end_time is not None and not is_date_only:
             end_iso = end_time.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+            remain_text = _format_remaining(end_time)
+        elif end_time is not None:
+            end_iso = end_time.date().isoformat()
+            remain_text = f"结算日：{end_iso}（具体时刻见规则）"
         else:
             end_iso = "-"
-        remain_text = _format_remaining(end_time)
+            remain_text = "-"
 
         print(f"{i:>2}. {title} | {outcome} | token_id={asset}")
         print(f"    数量={size} | 均价={_fmt_money(avg_price)} | 标记价={_fmt_money(cur_price)} | "
