@@ -8,7 +8,7 @@ EOA 版批量买单执行器：复用 Safe 版本的拆单、退让、余额兜�
 from collections.abc import Iterable as IterableABC, Mapping as MappingABC
 from decimal import Decimal, ROUND_UP
 from functools import lru_cache
-from typing import Any, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from trading.execution import (
     ClobPolymarketAPI,
@@ -19,6 +19,12 @@ from trading.execution import (
 )
 
 _NOTIONAL_BUFFER_RATIO = 0.01
+
+
+try:
+    from get_min_size_by_token import fetch_min_size_info as _gamma_fetch_min_size_info
+except Exception:  # pragma: no cover - 网络或依赖异常时降级
+    _gamma_fetch_min_size_info = None  # type: ignore[assignment]
 
 
 def _coerce_float(value: Any) -> Optional[float]:
@@ -430,7 +436,52 @@ def _fetch_best_ask_price(client, token_id: str) -> Optional[float]:
     return None
 
 
-def _fetch_market_min_order_size(client, token_id: str) -> Optional[float]:
+def _fetch_market_minimums(
+    client, token_id: str
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Fetch minimum share size and notional, preferring Gamma API data."""
+
+    min_size: Optional[float] = None
+    min_notional: Optional[float] = None
+    source: Optional[str] = None
+
+    fetcher: Optional[Callable[[str], Optional[Dict[str, Any]]]] = _gamma_fetch_min_size_info
+    if callable(fetcher):
+        try:
+            info = fetcher(token_id)
+        except Exception:
+            info = None
+        if isinstance(info, dict):
+            min_size = _coerce_float(info.get("min_size_shares"))
+            if min_size is not None and min_size <= 0:
+                min_size = None
+            min_notional = _coerce_float(info.get("min_notional_usd"))
+            if min_notional is not None and min_notional <= 0:
+                min_notional = None
+            src_value = info.get("source")
+            if src_value:
+                source = str(src_value)
+            elif min_size is not None or min_notional is not None:
+                source = "gamma"
+        elif info is not None:
+            source = "gamma"
+
+    if min_size is None:
+        legacy_size = _legacy_fetch_market_min_order_size(client, token_id)
+        if legacy_size is not None and legacy_size > 0:
+            min_size = float(legacy_size)
+            if source is None:
+                source = "legacy"
+
+    if min_notional is None and min_size is not None:
+        min_notional = 1.0
+        if source is None:
+            source = "default"
+
+    return min_size, min_notional, source
+
+
+def _legacy_fetch_market_min_order_size(client, token_id: str) -> Optional[float]:
     """Retrieve the market minimum order size using documented CLOB endpoints."""
 
     def _iter_candidate_containers():
@@ -671,11 +722,18 @@ def execute_auto_buy(
 ) -> ExecutionResult:
     hinted_min_order = _coerce_float(min_order_size)
     hinted_min_order = float(hinted_min_order) if hinted_min_order and hinted_min_order > 0 else 0.0
-    fetched_min_order = _fetch_market_min_order_size(client, token_id)
+    fetched_min_order, fetched_min_quote, min_fetch_source = _fetch_market_minimums(
+        client, token_id
+    )
     if fetched_min_order is not None and fetched_min_order > 0:
         fetched_min_order = float(fetched_min_order)
     else:
         fetched_min_order = 0.0
+
+    if fetched_min_quote is not None and fetched_min_quote > 0:
+        fetched_min_quote = float(fetched_min_quote)
+    else:
+        fetched_min_quote = 0.0
 
     effective_min_order = max(hinted_min_order, fetched_min_order)
 
@@ -692,7 +750,12 @@ def execute_auto_buy(
     original_slice_min = engine.config.order_slice_min
     original_slice_max = engine.config.order_slice_max
 
-    min_quote_floor = original_min_quote if original_min_quote and original_min_quote > 0 else 1.0
+    if fetched_min_quote > 0:
+        min_quote_floor = fetched_min_quote
+    elif original_min_quote and original_min_quote > 0:
+        min_quote_floor = float(original_min_quote)
+    else:
+        min_quote_floor = 1.0
     best_ask = _fetch_best_ask_price(client, token_id)
     size_dec, min_quote_override = _enforce_market_minimums(
         eff_price,
@@ -710,6 +773,10 @@ def execute_auto_buy(
         extra_flags.append(f"min_order_hint={hinted_min_order}")
     if fetched_min_order > 0:
         extra_flags.append(f"min_order_fetch={fetched_min_order}")
+    if fetched_min_quote > 0:
+        extra_flags.append(f"min_quote_fetch={fetched_min_quote}")
+    if min_fetch_source:
+        extra_flags.append(f"min_fetch_src={min_fetch_source}")
     if effective_min_order > 0:
         extra_flags.append(f"min_order_eff={effective_min_order}")
     if tick_size and tick_size > 0:
