@@ -93,7 +93,19 @@ CLAIM_ABI = [
             {"name": "indexSets", "type": "uint256[]"},
         ],
         "outputs": [],
-    }
+    },
+    {
+        "name": "balanceOfBatch",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "accounts", "type": "address[]"},
+            {"name": "ids", "type": "uint256[]"},
+        ],
+        "outputs": [
+            {"name": "balances", "type": "uint256[]"},
+        ],
+    },
 ]
 
 
@@ -374,10 +386,10 @@ def _deduce_index_set(raw: Dict[str, Any], token_id: str) -> Optional[int]:
     if outcome_text:
         lowered = outcome_text.lower()
         mapping = {
-            "yes": 1,
-            "no": 2,
-            "long": 1,
-            "short": 2,
+            "yes": 2,
+            "no": 1,
+            "long": 2,
+            "short": 1,
             "invalid": 4,
         }
         if lowered in mapping:
@@ -516,7 +528,39 @@ def _build_claim_position(raw: Dict[str, Any]) -> Optional[ClaimPosition]:
 
     shares, value = _extract_claim_numbers(raw)
 
-    size = _coerce_float(raw.get("size") or raw.get("positionSize"))
+    size = max(0.0, _coerce_float(raw.get("size") or raw.get("positionSize")))
+    shares = max(shares, 0.0)
+    value = max(value, 0.0)
+
+    if shares <= 0.0 and size > 0.0:
+        shares = size
+
+    mark_price_raw = _first_non_empty(
+        raw.get("markPrice"),
+        raw.get("mark_price"),
+        raw.get("price"),
+        raw.get("avg_price"),
+    )
+    mark_price = _coerce_float(mark_price_raw)
+    has_mark_price = mark_price_raw not in (None, "")
+    if mark_price < 0.0:
+        mark_price = 0.0
+
+    if value <= 0.0 and shares > 0.0:
+        payout_hint = _coerce_float(
+            raw.get("payout")
+            or raw.get("claimablePayout")
+            or raw.get("claimable_payout")
+            or raw.get("payoutPerShare")
+            or raw.get("payout_per_share")
+        )
+        if payout_hint > 0.0:
+            value = shares * payout_hint
+        elif has_mark_price:
+            value = shares * mark_price
+        else:
+            value = shares
+
     outcome = _first_non_empty(raw.get("outcome"), raw.get("side"), raw.get("outcome_name")) or ""
 
     position_id = _detect_position_id(raw)
@@ -542,9 +586,85 @@ def collect_claim_positions(positions: Sequence[Dict[str, Any]]) -> List[ClaimPo
     claimables: List[ClaimPosition] = []
     for entry in positions:
         pos = _build_claim_position(entry)
-        if pos:
+        if pos and (pos.claimable_shares > 0 or pos.claimable_value > 0):
             claimables.append(pos)
     return claimables
+
+
+def _filter_positions_with_onchain_balance(
+    positions: Sequence[ClaimPosition],
+    wallet_addr: str,
+    *,
+    rpc_url: str,
+    contract_address: str,
+) -> List[ClaimPosition]:
+    if not positions:
+        return []
+
+    try:
+        checksum_wallet = _ensure_checksum(wallet_addr)
+    except Exception as exc:
+        print(
+            "[WARN] 无法解析钱包地址 %s：%s，跳过链上余额校验。"
+            % (wallet_addr, exc)
+        )
+        return list(positions)
+
+    try:
+        w3 = _connect_web3(rpc_url)
+    except Exception as exc:
+        print("[WARN] 无法连接 RPC(%s)：%s，按 Data-API 结果继续。" % (rpc_url, exc))
+        return list(positions)
+
+    contract = _build_contract(w3, contract_address)
+
+    accounts: List[str] = []
+    token_ids: List[int] = []
+    for pos in positions:
+        accounts.append(checksum_wallet)
+        token_text = str(pos.token_id)
+        try:
+            token_ids.append(int(token_text, 0))
+        except Exception:
+            try:
+                token_ids.append(int(token_text))
+            except Exception as exc:
+                print(
+                    "[WARN] 无法解析 tokenId=%s：%s，跳过链上余额校验。"
+                    % (token_text, exc)
+                )
+                return list(positions)
+
+    try:
+        balances = contract.functions.balanceOfBatch(accounts, token_ids).call()
+    except Exception as exc:
+        print("[WARN] balanceOfBatch 调用失败，按 Data-API 结果继续：%s" % exc)
+        return list(positions)
+
+    filtered: List[ClaimPosition] = []
+    skipped: List[ClaimPosition] = []
+    for pos, bal in zip(positions, balances):
+        try:
+            bal_int = int(bal)
+        except Exception:
+            bal_int = 0
+        if bal_int > 0:
+            filtered.append(pos)
+        else:
+            skipped.append(pos)
+
+    if skipped:
+        print(
+            "[INFO] 检测到 %d 个仓位链上余额为 0，自动跳过。"
+            % len(skipped)
+        )
+        for pos in skipped:
+            print(
+                "[SKIP] token=%s market=%s"
+                % (pos.token_id, pos.market_title or pos.condition_id)
+            )
+
+    return filtered
 
 
 def group_claims(
@@ -568,9 +688,13 @@ def group_claims(
             groups[key] = grp
         grp.add(pos)
 
+    usd_threshold = float(min_usd or 0.0)
+
     result: List[ClaimGroup] = []
     for grp in groups.values():
-        if grp.total_claimable_value < min_usd and grp.total_claimable_shares <= 0:
+        if grp.total_claimable_shares <= 0 and grp.total_claimable_value <= 0:
+            continue
+        if grp.total_claimable_value < usd_threshold:
             continue
         if not grp.index_sets:
             continue
@@ -767,6 +891,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 3
 
     claim_positions = collect_claim_positions(positions)
+    claim_positions = _filter_positions_with_onchain_balance(
+        claim_positions,
+        wallet,
+        rpc_url=args.rpc_url,
+        contract_address=args.ct_address,
+    )
     if not claim_positions:
         print("[INFO] 当前没有可 claim 的仓位。")
         return 0
