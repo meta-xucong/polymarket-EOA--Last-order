@@ -12,14 +12,19 @@ from __future__ import annotations
 
 import os
 import sys
+from decimal import Decimal
+from functools import lru_cache
 from typing import Any, Dict, Optional, Set, Tuple
 
 from Volatility_fliter_EOA import (
     HighlightedOutcome,
     collect_filter_results,
 )
-from Volatility_buy_EOA import execute_auto_buy, _fetch_available_quote_balance
+from Volatility_buy_EOA import execute_auto_buy
 from trading.execution import ExecutionResult
+
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
 
 
 # --------------------------------------
@@ -44,6 +49,266 @@ def _get_client():
 
 
 _MIN_USDCE_BALANCE = 5.0
+
+_DEFAULT_POLYGON_RPC = "https://polygon-rpc.com"
+
+_ADDR_ENV_CANDIDATES = (
+    "POLY_EOA_ADDRESS",
+    "POLY_ADDRESS",
+    "POLY_WALLET",
+)
+
+_KEY_ENV_CANDIDATES = (
+    "POLY_EOA_KEY",
+    "POLY_KEY",
+    "POLY_PRIVATE_KEY",
+    "PRIVATE_KEY",
+)
+
+_RPC_ENV_CANDIDATES = (
+    "POLY_RPC_URL",
+    "POLYGON_RPC",
+    "POLY_RPC",
+    "RPC_URL",
+)
+
+_USDCE_ENV_CANDIDATES = (
+    "POLY_USDC_ADDRESS",
+    "USDCe_ADDRESS",
+    "USDCE_ADDRESS",
+    "USDC_ADDRESS",
+)
+
+_DEFAULT_USDCE_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+_ERC20_BALANCE_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+
+def _normalize_evm_address(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if not text.startswith(("0x", "0X")):
+        if len(text) == 40:
+            text = "0x" + text
+        else:
+            return None
+    if len(text) != 42:
+        return None
+    try:
+        return Web3.to_checksum_address(text)
+    except Exception:
+        return None
+
+
+def _derive_address_from_key(raw_key: Optional[str]) -> Optional[str]:
+    if not isinstance(raw_key, str):
+        return None
+    text = raw_key.strip()
+    if not text:
+        return None
+    if text.startswith(("0x", "0X")):
+        text = text[2:]
+    if len(text) != 64:
+        return None
+    try:
+        from eth_account import Account  # type: ignore
+    except Exception:
+        return None
+    try:
+        account = Account.from_key(bytes.fromhex(text))
+    except Exception:
+        return None
+    return _normalize_evm_address(getattr(account, "address", None))
+
+
+def _normalize_rpc_url(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+    return None
+
+
+def _resolve_usdce_address() -> str:
+    for env in _USDCE_ENV_CANDIDATES:
+        candidate = _normalize_evm_address(os.getenv(env))
+        if candidate:
+            return candidate
+    fallback = _normalize_evm_address(_DEFAULT_USDCE_ADDRESS)
+    if fallback:
+        return fallback
+    return _DEFAULT_USDCE_ADDRESS
+
+
+def _infer_wallet_address(client) -> Optional[str]:
+    attr_candidates = (
+        "wallet_address",
+        "wallet",
+        "address",
+        "account",
+        "owner",
+        "funder",
+        "trader_address",
+        "eoa_address",
+    )
+    for attr in attr_candidates:
+        if not hasattr(client, attr):
+            continue
+        try:
+            value = getattr(client, attr)
+        except Exception:
+            continue
+        normalized = _normalize_evm_address(value)
+        if normalized:
+            return normalized
+
+    getter_candidates = (
+        "get_wallet_address",
+        "get_address",
+        "get_account_address",
+        "get_default_address",
+    )
+    for name in getter_candidates:
+        fn = getattr(client, name, None)
+        if not callable(fn):
+            continue
+        try:
+            value = fn()
+        except Exception:
+            continue
+        normalized = _normalize_evm_address(value)
+        if normalized:
+            return normalized
+
+    for env in _ADDR_ENV_CANDIDATES:
+        normalized = _normalize_evm_address(os.getenv(env))
+        if normalized:
+            return normalized
+
+    for env in _KEY_ENV_CANDIDATES:
+        normalized = _derive_address_from_key(os.getenv(env))
+        if normalized:
+            return normalized
+
+    return None
+
+
+@lru_cache(maxsize=8)
+def _get_web3(rpc_url: str) -> Web3:
+    provider = Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20})
+    w3 = Web3(provider)
+    try:
+        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+    except ValueError:
+        pass
+    return w3
+
+
+def _infer_rpc_url(client) -> str:
+    attr_candidates = (
+        "rpc_url",
+        "rpc",
+        "polygon_rpc",
+        "rpc_endpoint",
+        "provider_url",
+    )
+    for attr in attr_candidates:
+        if not hasattr(client, attr):
+            continue
+        try:
+            value = getattr(client, attr)
+        except Exception:
+            continue
+        normalized = _normalize_rpc_url(value)
+        if normalized:
+            return normalized
+
+    getter_candidates = (
+        "get_rpc_url",
+        "get_polygon_rpc",
+        "get_provider_url",
+    )
+    for name in getter_candidates:
+        fn = getattr(client, name, None)
+        if not callable(fn):
+            continue
+        try:
+            value = fn()
+        except Exception:
+            continue
+        normalized = _normalize_rpc_url(value)
+        if normalized:
+            return normalized
+
+    for env in _RPC_ENV_CANDIDATES:
+        normalized = _normalize_rpc_url(os.getenv(env))
+        if normalized:
+            return normalized
+
+    return _DEFAULT_POLYGON_RPC
+
+
+def _fetch_available_quote_balance(client) -> Optional[float]:
+    """通过链上查询当前钱包地址的 USDC.e 余额。"""
+
+    address = _infer_wallet_address(client)
+    if not address:
+        raise RuntimeError(
+            "无法确定 EOA 地址，请设置 POLY_EOA_ADDRESS / POLY_ADDRESS 或提供私钥以导出。"
+        )
+
+    rpc_url = _infer_rpc_url(client)
+    w3 = _get_web3(rpc_url)
+    if not w3.is_connected():
+        raise RuntimeError(f"无法连接到 Polygon RPC: {rpc_url}")
+
+    checksum_owner = w3.to_checksum_address(address)
+    token_address = _resolve_usdce_address()
+    checksum_token = w3.to_checksum_address(token_address)
+    contract = w3.eth.contract(address=checksum_token, abi=_ERC20_BALANCE_ABI)
+
+    try:
+        raw_balance = contract.functions.balanceOf(checksum_owner).call()
+    except Exception as exc:
+        raise RuntimeError(f"balanceOf 调用失败：{exc}") from exc
+
+    decimals = 6
+    try:
+        queried = contract.functions.decimals().call()
+    except Exception:
+        queried = None
+    if queried is not None:
+        try:
+            decimals = max(0, int(queried))
+        except (TypeError, ValueError):
+            decimals = 6
+
+    try:
+        balance_dec = Decimal(int(raw_balance)) / (Decimal(10) ** decimals)
+    except Exception as exc:
+        raise RuntimeError(f"无法换算余额：{exc}") from exc
+
+    return float(balance_dec)
 
 
 def _ensure_minimum_usdce_balance(client) -> bool:
