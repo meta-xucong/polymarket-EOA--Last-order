@@ -8,7 +8,7 @@ EOA 版批量买单执行器：复用 Safe 版本的拆单、退让、余额兜�
 from collections.abc import Iterable as IterableABC, Mapping as MappingABC
 from decimal import Decimal, ROUND_UP
 from functools import lru_cache
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Set, Tuple
 
 from trading.execution import (
     ClobPolymarketAPI,
@@ -297,12 +297,36 @@ def _extract_min_order_size_from_market(payload: Any) -> Optional[float]:
     """Parse the documented ``minimum_order_size`` field from market metadata."""
 
     if isinstance(payload, MappingABC):
-        candidate = _coerce_float(payload.get("minimum_order_size"))
-        if candidate and candidate > 0:
-            return float(candidate)
-        candidate = _coerce_float(payload.get("minimumOrderSize"))
-        if candidate and candidate > 0:
-            return float(candidate)
+        candidate_keys = (
+            "minimum_order_size",
+            "minimumOrderSize",
+            "min_order_size",
+            "minOrderSize",
+            "min_size",
+            "minSize",
+        )
+        for key in candidate_keys:
+            if key in payload:
+                candidate = _coerce_float(payload.get(key))
+                if candidate and candidate > 0:
+                    return float(candidate)
+
+        nested_keys = (
+            "market",
+            "result",
+            "data",
+            "info",
+            "clob",
+            "clob_market",
+            "clobMarket",
+            "clob_token_market",
+            "clobTokenMarket",
+        )
+        for key in nested_keys:
+            if key in payload:
+                extracted = _extract_min_order_size_from_market(payload[key])
+                if extracted is not None:
+                    return extracted
 
     if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
@@ -320,18 +344,30 @@ def _extract_min_order_size_from_book(payload: Any) -> Optional[float]:
     """Parse the documented ``min_order_size`` field from an order book payload."""
 
     if isinstance(payload, MappingABC):
-        for key in ("min_order_size", "minOrderSize"):
-            candidate = _coerce_float(payload.get(key))
-            if candidate and candidate > 0:
-                return float(candidate)
+        candidate_keys = (
+            "min_order_size",
+            "minOrderSize",
+            "minimum_order_size",
+            "minimumOrderSize",
+            "min_size",
+            "minSize",
+        )
+        for key in candidate_keys:
+            if key in payload:
+                candidate = _coerce_float(payload.get(key))
+                if candidate and candidate > 0:
+                    return float(candidate)
 
         nested_keys = (
             "book",
             "order_book",
             "orderBook",
+            "orderbook",
+            "books",
             "data",
             "result",
-            "books",
+            "market",
+            "info",
         )
         for key in nested_keys:
             if key in payload:
@@ -397,55 +433,136 @@ def _fetch_best_ask_price(client, token_id: str) -> Optional[float]:
 def _fetch_market_min_order_size(client, token_id: str) -> Optional[float]:
     """Retrieve the market minimum order size using documented CLOB endpoints."""
 
+    def _iter_candidate_containers():
+        yield client
+        nested_attrs = (
+            "public",
+            "private",
+            "market",
+            "markets",
+            "rest",
+            "api",
+            "client",
+        )
+        for attr in nested_attrs:
+            try:
+                nested = getattr(client, attr)
+            except Exception:
+                continue
+            if nested is None:
+                continue
+            yield nested
+
     def _invoke(name: str, **kwargs):
-        fn = getattr(client, name, None)
-        if not callable(fn):
-            return None
-        try:
-            return fn(**kwargs)
-        except TypeError:
-            return None
-        except Exception:
-            return None
+        seen_ids: Set[int] = set()
+        for container in _iter_candidate_containers():
+            try:
+                fn = getattr(container, name)
+            except Exception:
+                continue
+            if not callable(fn):
+                continue
+            fn_id = id(fn)
+            if fn_id in seen_ids:
+                continue
+            seen_ids.add(fn_id)
+            try:
+                return fn(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+        return None
 
-    book_resp = _invoke("get_order_book", token_id=token_id)
-    if book_resp is None:
-        book_resp = _invoke("get_order_book", market=token_id)
-    if book_resp is not None:
-        payload = book_resp[1] if isinstance(book_resp, tuple) and len(book_resp) == 2 else book_resp
+    def _normalize_payload(resp: Any) -> Any:
+        payload = resp[1] if isinstance(resp, tuple) and len(resp) == 2 else resp
         if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
             payload = payload.get("data")
+        return payload
+
+    book_method_candidates = (
+        ("get_order_book", {"token_id": token_id}),
+        ("get_order_book", {"market": token_id}),
+        ("get_order_book", {"market_id": token_id}),
+        ("get_market_orderbook", {"token_id": token_id}),
+        ("get_market_orderbook", {"market": token_id}),
+        ("get_market_orderbook", {"market_id": token_id}),
+        ("get_market_order_book", {"token_id": token_id}),
+        ("get_market_order_book", {"market": token_id}),
+        ("get_market_order_book", {"market_id": token_id}),
+        ("get_orderbook", {"token_id": token_id}),
+        ("get_orderbook", {"market": token_id}),
+        ("get_orderbook", {"market_id": token_id}),
+        ("order_book", {"token_id": token_id}),
+        ("order_book", {"market": token_id}),
+        ("order_book", {"market_id": token_id}),
+        ("get_order_book_summary", {"token_id": token_id}),
+        ("get_order_book_summary", {"market": token_id}),
+        ("get_order_book_summary", {"market_id": token_id}),
+    )
+    for name, kwargs in book_method_candidates:
+        resp = _invoke(name, **kwargs)
+        if resp is None:
+            continue
+        payload = _normalize_payload(resp)
         extracted = _extract_min_order_size_from_book(payload)
         if extracted is not None and extracted > 0:
             return float(extracted)
 
-    books_resp = _invoke("get_order_books", token_ids=[token_id])
-    if books_resp is None:
-        books_resp = _invoke("get_order_books", markets=[token_id])
-    if books_resp is not None:
-        payload = books_resp[1] if isinstance(books_resp, tuple) and len(books_resp) == 2 else books_resp
-        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
-            payload = payload.get("data")
+    books_method_candidates = (
+        ("get_order_books", {"token_ids": [token_id]}),
+        ("get_order_books", {"markets": [token_id]}),
+        ("get_order_books", {"market_ids": [token_id]}),
+        ("get_market_orderbooks", {"token_ids": [token_id]}),
+        ("get_market_orderbooks", {"markets": [token_id]}),
+        ("get_market_orderbooks", {"market_ids": [token_id]}),
+        ("get_market_order_books", {"token_ids": [token_id]}),
+        ("get_market_order_books", {"markets": [token_id]}),
+        ("get_market_order_books", {"market_ids": [token_id]}),
+    )
+    for name, kwargs in books_method_candidates:
+        resp = _invoke(name, **kwargs)
+        if resp is None:
+            continue
+        payload = _normalize_payload(resp)
         extracted = _extract_min_order_size_from_book(payload)
         if extracted is not None and extracted > 0:
             return float(extracted)
 
-    markets_resp = _invoke("get_markets", ids=[token_id])
-    if markets_resp is not None:
-        payload = markets_resp[1] if isinstance(markets_resp, tuple) and len(markets_resp) == 2 else markets_resp
-        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
-            payload = payload.get("data")
+    markets_method_candidates = (
+        ("get_markets", {"ids": [token_id]}),
+        ("get_markets", {"token_ids": [token_id]}),
+        ("get_markets", {"market_ids": [token_id]}),
+        ("list_markets", {"ids": [token_id]}),
+        ("list_markets", {"token_ids": [token_id]}),
+        ("list_markets", {"market_ids": [token_id]}),
+        ("markets", {"ids": [token_id]}),
+        ("markets", {"market_ids": [token_id]}),
+    )
+    for name, kwargs in markets_method_candidates:
+        resp = _invoke(name, **kwargs)
+        if resp is None:
+            continue
+        payload = _normalize_payload(resp)
         extracted = _extract_min_order_size_from_market(payload)
         if extracted is not None and extracted > 0:
             return float(extracted)
 
-    market_resp = _invoke("get_market", token_id=token_id)
-    if market_resp is None:
-        market_resp = _invoke("get_market", market=token_id)
-    if market_resp is not None:
-        payload = market_resp[1] if isinstance(market_resp, tuple) and len(market_resp) == 2 else market_resp
-        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
-            payload = payload.get("data")
+    market_method_candidates = (
+        ("get_market", {"token_id": token_id}),
+        ("get_market", {"market": token_id}),
+        ("get_market", {"market_id": token_id}),
+        ("fetch_market", {"token_id": token_id}),
+        ("fetch_market", {"market": token_id}),
+        ("fetch_market", {"market_id": token_id}),
+        ("market", {"token_id": token_id}),
+        ("market", {"market_id": token_id}),
+    )
+    for name, kwargs in market_method_candidates:
+        resp = _invoke(name, **kwargs)
+        if resp is None:
+            continue
+        payload = _normalize_payload(resp)
         extracted = _extract_min_order_size_from_market(payload)
         if extracted is not None and extracted > 0:
             return float(extracted)
