@@ -18,7 +18,7 @@ from Volatility_fliter_EOA import (
     HighlightedOutcome,
     collect_filter_results,
 )
-from Volatility_buy_EOA import execute_auto_buy
+from Volatility_buy_EOA import execute_auto_buy, _fetch_available_quote_balance
 from trading.execution import ExecutionResult
 
 
@@ -41,6 +41,28 @@ def _get_client():
         except Exception as exc_rest:  # pragma: no cover - 仅在运行时展示
             print(f"[ERR] 无法导入 get_client：{exc_ws} | {exc_rest}")
             sys.exit(1)
+
+
+_MIN_USDCE_BALANCE = 5.0
+
+
+def _ensure_minimum_usdce_balance(client) -> bool:
+    available = None
+    try:
+        available = _fetch_available_quote_balance(client)
+    except Exception as exc:  # pragma: no cover - 仅运行时提示
+        print(f"[WARN] 获取 USDC.e 余额失败：{exc}。将继续执行后续流程。")
+        return True
+
+    if available is None:
+        print("[WARN] 无法获取 USDC.e 余额，将继续执行后续流程。")
+        return True
+
+    print(f"[INFO] 当前 USDC.e 可用余额：{available:.4f}")
+    if available + 1e-9 < _MIN_USDCE_BALANCE:
+        print("余额太少，本轮跳过")
+        return False
+    return True
 
 
 def _coerce_positive_float(value: Any) -> Optional[float]:
@@ -329,6 +351,11 @@ def main() -> None:
     else:
         print("[INFO] 未输入买入份数，将按市场最小下单量或默认 1 份执行。")
 
+    print("[STEP] 初始化 CLOB 客户端…")
+    client = _get_client()
+    if not _ensure_minimum_usdce_balance(client):
+        return
+
     print("[STEP] 正在运行市场筛选器…")
     result = collect_filter_results()
     highlights = list(result.highlights)
@@ -351,8 +378,6 @@ def main() -> None:
     for idx, ho in enumerate(highlights, start=1):
         print(_format_highlight(ho, idx))
 
-    print("[STEP] 初始化 CLOB 客户端…")
-    client = _get_client()
     creds = _extract_api_creds(client)
     if not creds or not creds.get("key") or not creds.get("secret"):
         print("[ERR] 无法获取完整的 API 凭证，请检查配置后重试。")
