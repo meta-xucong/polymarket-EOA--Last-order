@@ -15,8 +15,9 @@ get_min_size_by_token.py
 import argparse
 import json
 import sys
-import requests
 from typing import Any, Dict, Optional
+
+import requests
 
 GAMMA_ENDPOINTS = [
     "https://gamma-api.polymarket.com/markets",
@@ -44,6 +45,27 @@ def _first_market_by_token(token_id: str) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
     return None
+
+
+def fetch_min_size_info(token_id: str) -> Optional[Dict[str, Any]]:
+    """Return market metadata with minimum size info for ``token_id``."""
+
+    if not token_id:
+        return None
+
+    market = _first_market_by_token(token_id)
+    if not market:
+        return None
+
+    min_shares = _extract_min_shares(market)
+    return {
+        "token_id": token_id,
+        "market_id": market.get("id"),
+        "slug": market.get("slug"),
+        "min_size_shares": min_shares,
+        "min_notional_usd": 1,  # CLOB 名义额门槛（price * size ≥ 1 USD）
+        "source": "gamma?clob_token_ids",
+    }
 
 def _extract_min_shares(market: Dict[str, Any]) -> Optional[int]:
     # 常见字段名
@@ -82,8 +104,8 @@ def main():
         print("usage: get_min_size_by_token.py (--token-id TOKEN_ID | TOKEN_ID)", file=sys.stderr)
         sys.exit(2)
 
-    market = _first_market_by_token(token_id)
-    if not market:
+    info = fetch_min_size_info(token_id)
+    if not info:
         out = {
             "token_id": token_id,
             "error": "NOT_FOUND_IN_GAMMA_BY_clob_token_ids",
@@ -92,16 +114,7 @@ def main():
         print(json.dumps(out, ensure_ascii=False, indent=2))
         sys.exit(1)
 
-    min_shares = _extract_min_shares(market)
-    out = {
-        "token_id": token_id,
-        "market_id": market.get("id"),
-        "slug": market.get("slug"),
-        "min_size_shares": min_shares,
-        "min_notional_usd": 1,   # CLOB 名义额门槛（price * size ≥ 1 USD）
-        "source": "gamma?clob_token_ids"
-    }
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    print(json.dumps(info, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
     main()
