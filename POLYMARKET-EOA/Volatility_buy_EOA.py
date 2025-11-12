@@ -178,7 +178,19 @@ def _quantize_up(value: Decimal, quantum: Decimal) -> Decimal:
         return value
     quotient = (value / quantum).to_integral_value(rounding=ROUND_UP)
     result = quotient * quantum
-    return result.quantize(quantum, rounding=ROUND_UP)
+    # Polymarket 限价上限为 0.999。若向上取整后达到或超过 1，
+    # 则回退到下一个可用档位，确保最终价格仍落在允许区间内。
+    if result >= Decimal("1"):
+        adjusted = (quotient - 1) * quantum
+        if adjusted > Decimal("0"):
+            result = adjusted
+        else:
+            # 兜底：即便量化步长异常大，也至少保证落在允许区间内。
+            result = Decimal("0.999")
+    quantized = result.quantize(quantum, rounding=ROUND_UP)
+    if quantized >= Decimal("1"):
+        return Decimal("0.999")
+    return quantized
 
 
 def _min_legal_pair(
