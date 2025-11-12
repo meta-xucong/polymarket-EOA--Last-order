@@ -293,67 +293,47 @@ def _extract_best_ask(payload: Any) -> Optional[float]:
     return None
 
 
-def _extract_min_order_size(payload: Any) -> Optional[float]:
-    numeric = _coerce_float(payload)
-    if numeric is not None and numeric > 0:
-        return numeric
+def _extract_min_order_size_from_summary(payload: Any) -> Optional[float]:
+    """Parse the documented ``minOrderSize`` field from an order book summary."""
 
     if isinstance(payload, MappingABC):
-        primary_keys = (
-            "min_order_size",
-            "minimum_order_size",
-            "minOrderSize",
-            "minimumOrderSize",
-            "min_order",
-            "minimum_order",
-            "minOrder",
-            "minTradeSize",
-            "minimumTradeSize",
-            "minSize",
-            "minimumSize",
-        )
-        for key in primary_keys:
-            if key in payload:
-                extracted = _extract_min_order_size(payload[key])
-                if extracted is not None and extracted > 0:
-                    return extracted
-
-        container_keys = (
-            "summary",
-            "order_book",
-            "orderBook",
-            "order_book_summary",
-            "orderBookSummary",
-            "market",
-            "market_data",
-            "marketData",
-            "metadata",
-            "meta",
-            "constraints",
-            "config",
-            "data",
-            "result",
-            "info",
-        )
-        for key in container_keys:
-            if key in payload:
-                extracted = _extract_min_order_size(payload[key])
-                if extracted is not None and extracted > 0:
-                    return extracted
-
-        for value in payload.values():
-            extracted = _extract_min_order_size(value)
-            if extracted is not None and extracted > 0:
-                return extracted
-        return None
+        summary_section = payload.get("summary", payload)
+        candidate = _coerce_float(summary_section.get("minOrderSize"))
+        if candidate and candidate > 0:
+            return float(candidate)
 
     if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
-            extracted = _extract_min_order_size(item)
-            if extracted is not None and extracted > 0:
+            extracted = _extract_min_order_size_from_summary(item)
+            if extracted is not None:
                 return extracted
-        return None
 
+    fallback = _coerce_float(payload)
+    if fallback and fallback > 0:
+        return float(fallback)
+    return None
+
+
+def _extract_min_order_size_from_market(payload: Any) -> Optional[float]:
+    """Parse the documented ``minimum_order_size`` field from market metadata."""
+
+    if isinstance(payload, MappingABC):
+        candidate = _coerce_float(payload.get("minimum_order_size"))
+        if candidate and candidate > 0:
+            return float(candidate)
+        candidate = _coerce_float(payload.get("minimumOrderSize"))
+        if candidate and candidate > 0:
+            return float(candidate)
+
+    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            extracted = _extract_min_order_size_from_market(item)
+            if extracted is not None:
+                return extracted
+
+    numeric = _coerce_float(payload)
+    if numeric and numeric > 0:
+        return float(numeric)
     return None
 
 
@@ -401,45 +381,49 @@ def _fetch_best_ask_price(client, token_id: str) -> Optional[float]:
 
 
 def _fetch_market_min_order_size(client, token_id: str) -> Optional[float]:
-    """Attempt to retrieve the minimum order size configured for the market."""
+    """Retrieve the market minimum order size using documented CLOB endpoints."""
 
-    method_candidates = (
-        ("get_order_book_summary", {"market": token_id}),
-        ("get_order_book_summary", {"token_id": token_id}),
-        ("get_market_orderbook_summary", {"market": token_id}),
-        ("get_market_orderbook_summary", {"token_id": token_id}),
-        ("get_market_summary", {"market": token_id}),
-        ("get_market_summary", {"token_id": token_id}),
-        ("get_market_orderbook", {"market": token_id}),
-        ("get_market_orderbook", {"token_id": token_id}),
-        ("get_order_book", {"market": token_id}),
-        ("get_order_book", {"token_id": token_id}),
-        ("get_market", {"market": token_id}),
-        ("get_market", {"token_id": token_id}),
-        ("get_market_data", {"market": token_id}),
-        ("get_market_data", {"token_id": token_id}),
-    )
-
-    for name, kwargs in method_candidates:
+    def _invoke(name: str, **kwargs):
         fn = getattr(client, name, None)
         if not callable(fn):
-            continue
+            return None
         try:
-            resp = fn(**kwargs)
+            return fn(**kwargs)
         except TypeError:
-            continue
+            return None
         except Exception:
-            continue
+            return None
 
-        payload = resp
-        if isinstance(resp, tuple) and len(resp) == 2:
-            payload = resp[1]
+    summary_resp = _invoke("get_order_book_summary", market=token_id)
+    if summary_resp is None:
+        summary_resp = _invoke("get_order_book_summary", token_id=token_id)
+    if summary_resp is not None:
+        payload = summary_resp[1] if isinstance(summary_resp, tuple) and len(summary_resp) == 2 else summary_resp
         if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
             payload = payload.get("data")
+        extracted = _extract_min_order_size_from_summary(payload)
+        if extracted is not None and extracted > 0:
+            return float(extracted)
 
-        min_order = _extract_min_order_size(payload)
-        if min_order is not None and min_order > 0:
-            return float(min_order)
+    markets_resp = _invoke("get_markets", ids=[token_id])
+    if markets_resp is not None:
+        payload = markets_resp[1] if isinstance(markets_resp, tuple) and len(markets_resp) == 2 else markets_resp
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+            payload = payload.get("data")
+        extracted = _extract_min_order_size_from_market(payload)
+        if extracted is not None and extracted > 0:
+            return float(extracted)
+
+    market_resp = _invoke("get_market", market=token_id)
+    if market_resp is None:
+        market_resp = _invoke("get_market", token_id=token_id)
+    if market_resp is not None:
+        payload = market_resp[1] if isinstance(market_resp, tuple) and len(market_resp) == 2 else market_resp
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+            payload = payload.get("data")
+        extracted = _extract_min_order_size_from_market(payload)
+        if extracted is not None and extracted > 0:
+            return float(extracted)
 
     return None
 

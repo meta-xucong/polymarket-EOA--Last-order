@@ -356,7 +356,6 @@ def _infer_min_order_size(highlight: HighlightedOutcome) -> Optional[float]:
         "minimumOrderSize",
         "minimum_order_size",
         "minOrderSize",
-        "min_order_size",
     ):
         val = _coerce_positive_float(raw.get(key))
         if val is not None:
