@@ -71,6 +71,12 @@ def _extract_available_quote(payload: Any) -> Optional[float]:
             "usdc",
             "USD",
             "usd",
+            "USDC.e",
+            "usdc.e",
+            "USDC.E",
+            "USDCe",
+            "usdce",
+            "USDCE",
             "quote",
             "QUOTE",
         )
