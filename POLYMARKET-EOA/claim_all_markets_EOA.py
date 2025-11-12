@@ -386,10 +386,10 @@ def _deduce_index_set(raw: Dict[str, Any], token_id: str) -> Optional[int]:
     if outcome_text:
         lowered = outcome_text.lower()
         mapping = {
-            "yes": 1,
-            "no": 2,
-            "long": 1,
-            "short": 2,
+            "yes": 2,
+            "no": 1,
+            "long": 2,
+            "short": 1,
             "invalid": 4,
         }
         if lowered in mapping:
