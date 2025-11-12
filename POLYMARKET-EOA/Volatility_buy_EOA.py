@@ -24,7 +24,7 @@ _NOTIONAL_BUFFER_RATIO = 0.01
 def _coerce_float(value: Any) -> Optional[float]:
     if value is None:
         return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
         return float(value)
     if isinstance(value, str):
         raw = value.strip()
