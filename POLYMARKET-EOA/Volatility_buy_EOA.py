@@ -293,6 +293,70 @@ def _extract_best_ask(payload: Any) -> Optional[float]:
     return None
 
 
+def _extract_min_order_size(payload: Any) -> Optional[float]:
+    numeric = _coerce_float(payload)
+    if numeric is not None and numeric > 0:
+        return numeric
+
+    if isinstance(payload, MappingABC):
+        primary_keys = (
+            "min_order_size",
+            "minimum_order_size",
+            "minOrderSize",
+            "minimumOrderSize",
+            "min_order",
+            "minimum_order",
+            "minOrder",
+            "minTradeSize",
+            "minimumTradeSize",
+            "minSize",
+            "minimumSize",
+        )
+        for key in primary_keys:
+            if key in payload:
+                extracted = _extract_min_order_size(payload[key])
+                if extracted is not None and extracted > 0:
+                    return extracted
+
+        container_keys = (
+            "summary",
+            "order_book",
+            "orderBook",
+            "order_book_summary",
+            "orderBookSummary",
+            "market",
+            "market_data",
+            "marketData",
+            "metadata",
+            "meta",
+            "constraints",
+            "config",
+            "data",
+            "result",
+            "info",
+        )
+        for key in container_keys:
+            if key in payload:
+                extracted = _extract_min_order_size(payload[key])
+                if extracted is not None and extracted > 0:
+                    return extracted
+
+        for value in payload.values():
+            extracted = _extract_min_order_size(value)
+            if extracted is not None and extracted > 0:
+                return extracted
+        return None
+
+    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            extracted = _extract_min_order_size(item)
+            if extracted is not None and extracted > 0:
+                return extracted
+        return None
+
+    return None
+
+
 def _fetch_best_ask_price(client, token_id: str) -> Optional[float]:
     """Best-effort retrieval of the current best ask for the given market."""
 
@@ -332,6 +396,50 @@ def _fetch_best_ask_price(client, token_id: str) -> Optional[float]:
         best_ask = _extract_best_ask(payload)
         if best_ask is not None:
             return float(best_ask)
+
+    return None
+
+
+def _fetch_market_min_order_size(client, token_id: str) -> Optional[float]:
+    """Attempt to retrieve the minimum order size configured for the market."""
+
+    method_candidates = (
+        ("get_order_book_summary", {"market": token_id}),
+        ("get_order_book_summary", {"token_id": token_id}),
+        ("get_market_orderbook_summary", {"market": token_id}),
+        ("get_market_orderbook_summary", {"token_id": token_id}),
+        ("get_market_summary", {"market": token_id}),
+        ("get_market_summary", {"token_id": token_id}),
+        ("get_market_orderbook", {"market": token_id}),
+        ("get_market_orderbook", {"token_id": token_id}),
+        ("get_order_book", {"market": token_id}),
+        ("get_order_book", {"token_id": token_id}),
+        ("get_market", {"market": token_id}),
+        ("get_market", {"token_id": token_id}),
+        ("get_market_data", {"market": token_id}),
+        ("get_market_data", {"token_id": token_id}),
+    )
+
+    for name, kwargs in method_candidates:
+        fn = getattr(client, name, None)
+        if not callable(fn):
+            continue
+        try:
+            resp = fn(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            continue
+
+        payload = resp
+        if isinstance(resp, tuple) and len(resp) == 2:
+            payload = resp[1]
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+            payload = payload.get("data")
+
+        min_order = _extract_min_order_size(payload)
+        if min_order is not None and min_order > 0:
+            return float(min_order)
 
     return None
 
@@ -435,10 +543,20 @@ def execute_auto_buy(
     min_order_size: float = 0.0,
     tick_size: float = 0.0,
 ) -> ExecutionResult:
+    hinted_min_order = _coerce_float(min_order_size)
+    hinted_min_order = float(hinted_min_order) if hinted_min_order and hinted_min_order > 0 else 0.0
+    fetched_min_order = _fetch_market_min_order_size(client, token_id)
+    if fetched_min_order is not None and fetched_min_order > 0:
+        fetched_min_order = float(fetched_min_order)
+    else:
+        fetched_min_order = 0.0
+
+    effective_min_order = max(hinted_min_order, fetched_min_order)
+
     eff_price, eff_size, maker = _min_legal_pair(
         price,
         size,
-        minimum_size=min_order_size,
+        minimum_size=effective_min_order,
         tick_size=tick_size,
     )
     engine = _build_engine(client)
@@ -462,8 +580,12 @@ def execute_auto_buy(
     engine.config.min_quote_amount = float(min_quote_override)
 
     extra_flags = []
-    if min_order_size and min_order_size > 0:
-        extra_flags.append(f"min_order_size={min_order_size}")
+    if hinted_min_order > 0:
+        extra_flags.append(f"min_order_hint={hinted_min_order}")
+    if fetched_min_order > 0:
+        extra_flags.append(f"min_order_fetch={fetched_min_order}")
+    if effective_min_order > 0:
+        extra_flags.append(f"min_order_eff={effective_min_order}")
     if tick_size and tick_size > 0:
         extra_flags.append(f"tick_size={tick_size}")
     if best_ask is not None and best_ask > 0:
@@ -478,11 +600,6 @@ def execute_auto_buy(
     )
 
     try:
-        effective_min_order: Optional[float]
-        try:
-            effective_min_order = float(min_order_size)
-        except (TypeError, ValueError):
-            effective_min_order = None
         if effective_min_order and effective_min_order > 0:
             engine.config.min_market_order_size = effective_min_order
             if engine.config.order_slice_min < effective_min_order:
