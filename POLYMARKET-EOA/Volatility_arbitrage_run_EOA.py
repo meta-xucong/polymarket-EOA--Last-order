@@ -3,7 +3,7 @@
 """Volatility_arbitrage_run_EOA.py  ·  买入流程入口
 
 新版入口仅负责三件事：
-1. 启动时询问买入份数（留空则按市场最小下单量执行）；
+1. 通过配置的买入份数（留空则按市场最小下单量执行）；
 2. 调用 Volatility_fliter_EOA 运行最新筛选，获取满足严格条件的市场/方向；
 3. 针对命中的 token 逐一执行买单，不再包含价格监控、卖出或自动 claim 逻辑。
 """
@@ -80,6 +80,9 @@ _USDCE_ENV_CANDIDATES = (
 )
 
 _DEFAULT_USDCE_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+# None 表示留空（使用市场最小下单量或默认 1 份）
+_DESIRED_ORDER_SIZE = None
 
 _ERC20_BALANCE_ABI = [
     {
@@ -543,30 +546,6 @@ def _run_claim_workflow() -> Optional[int]:
         return -1
 
 
-def _prompt_order_size() -> Optional[float]:
-    prompt = "请输入买入份数（留空=使用市场最小下单量）："
-    while True:
-        try:
-            raw = input(prompt)
-        except EOFError:
-            print("\n[INFO] 未提供输入，默认为市场最小下单量。")
-            return None
-        if raw is None:
-            return None
-        raw = raw.strip()
-        if not raw:
-            return None
-        try:
-            val = float(raw)
-        except ValueError:
-            print("[WARN] 无法解析输入，请输入正数或直接回车。")
-            continue
-        if val <= 0:
-            print("[WARN] 买入份数必须为正数，请重新输入。")
-            continue
-        return float(val)
-
-
 def _format_highlight(ho: HighlightedOutcome, index: int) -> str:
     ms = ho.market
     snap = ho.outcome
@@ -611,11 +590,11 @@ def _print_execution_result(resp: ExecutionResult) -> None:
 
 
 def main() -> None:
-    desired_size = _prompt_order_size()
+    desired_size = _DESIRED_ORDER_SIZE
     if desired_size is not None:
-        print(f"[INFO] 将按输入份数 {desired_size} 执行买单。")
+        print(f"[INFO] 将按配置份数 {desired_size} 执行买单。")
     else:
-        print("[INFO] 未输入买入份数，将按市场最小下单量或默认 1 份执行。")
+        print("[INFO] 未配置买入份数，将按市场最小下单量或默认 1 份执行。")
 
     print("[STEP] 初始化 CLOB 客户端…")
     client = _get_client()
