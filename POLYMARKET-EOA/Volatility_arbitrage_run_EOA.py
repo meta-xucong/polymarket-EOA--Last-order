@@ -314,24 +314,24 @@ def _fetch_available_quote_balance(client) -> Optional[float]:
     return float(balance_dec)
 
 
-def _ensure_minimum_usdce_balance(client) -> bool:
-    available = None
+def _ensure_minimum_usdce_balance(client) -> Tuple[bool, Optional[float]]:
+    available: Optional[float] = None
     try:
         available = _fetch_available_quote_balance(client)
     except Exception as exc:  # pragma: no cover - 仅运行时提示
         print(f"[ERR] 获取 USDC.e 余额失败：{exc}")
         print("余额获取失败，请检查原因")
-        return False
+        return False, None
 
     if available is None:
         print("余额获取失败，请检查原因")
-        return False
+        return False, None
 
     print(f"[INFO] 当前 USDC.e 可用余额：{available:.4f}")
     if available + 1e-9 < _MIN_USDCE_BALANCE:
         print("余额太少，本轮跳过")
-        return False
-    return True
+        return False, available
+    return True, available
 
 
 def _coerce_positive_float(value: Any) -> Optional[float]:
@@ -597,7 +597,14 @@ def main() -> None:
 
     print("[STEP] 初始化 CLOB 客户端…")
     client = _get_client()
-    if not _ensure_minimum_usdce_balance(client):
+    balance_ok, available_balance = _ensure_minimum_usdce_balance(client)
+    if not balance_ok:
+        if available_balance is not None and available_balance + 1e-9 < _MIN_USDCE_BALANCE:
+            print("[STEP] 余额不足 5 USDC，尝试执行 Claim…")
+            claim_code = _run_claim_workflow()
+            if claim_code is not None:
+                status = "成功" if claim_code == 0 else f"退出码 {claim_code}"
+                print(f"[INFO] Claim 流程已执行：{status}。")
         return
 
     print("[STEP] 正在运行市场筛选器…")
