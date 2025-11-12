@@ -178,7 +178,19 @@ def _quantize_up(value: Decimal, quantum: Decimal) -> Decimal:
         return value
     quotient = (value / quantum).to_integral_value(rounding=ROUND_UP)
     result = quotient * quantum
-    return result.quantize(quantum, rounding=ROUND_UP)
+    # Polymarket 限价上限为 0.999。若向上取整后达到或超过 1，
+    # 则回退到下一个可用档位，确保最终价格仍落在允许区间内。
+    if result >= Decimal("1"):
+        adjusted = (quotient - 1) * quantum
+        if adjusted > Decimal("0"):
+            result = adjusted
+        else:
+            # 兜底：即便量化步长异常大，也至少保证落在允许区间内。
+            result = Decimal("0.999")
+    quantized = result.quantize(quantum, rounding=ROUND_UP)
+    if quantized >= Decimal("1"):
+        return Decimal("0.999")
+    return quantized
 
 
 def _min_legal_pair(
@@ -281,6 +293,64 @@ def _extract_best_ask(payload: Any) -> Optional[float]:
     return None
 
 
+def _extract_min_order_size_from_market(payload: Any) -> Optional[float]:
+    """Parse the documented ``minimum_order_size`` field from market metadata."""
+
+    if isinstance(payload, MappingABC):
+        candidate = _coerce_float(payload.get("minimum_order_size"))
+        if candidate and candidate > 0:
+            return float(candidate)
+        candidate = _coerce_float(payload.get("minimumOrderSize"))
+        if candidate and candidate > 0:
+            return float(candidate)
+
+    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            extracted = _extract_min_order_size_from_market(item)
+            if extracted is not None:
+                return extracted
+
+    numeric = _coerce_float(payload)
+    if numeric and numeric > 0:
+        return float(numeric)
+    return None
+
+
+def _extract_min_order_size_from_book(payload: Any) -> Optional[float]:
+    """Parse the documented ``min_order_size`` field from an order book payload."""
+
+    if isinstance(payload, MappingABC):
+        for key in ("min_order_size", "minOrderSize"):
+            candidate = _coerce_float(payload.get(key))
+            if candidate and candidate > 0:
+                return float(candidate)
+
+        nested_keys = (
+            "book",
+            "order_book",
+            "orderBook",
+            "data",
+            "result",
+            "books",
+        )
+        for key in nested_keys:
+            if key in payload:
+                extracted = _extract_min_order_size_from_book(payload[key])
+                if extracted is not None:
+                    return extracted
+
+    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            extracted = _extract_min_order_size_from_book(item)
+            if extracted is not None:
+                return extracted
+
+    numeric = _coerce_float(payload)
+    if numeric and numeric > 0:
+        return float(numeric)
+    return None
+
+
 def _fetch_best_ask_price(client, token_id: str) -> Optional[float]:
     """Best-effort retrieval of the current best ask for the given market."""
 
@@ -320,6 +390,65 @@ def _fetch_best_ask_price(client, token_id: str) -> Optional[float]:
         best_ask = _extract_best_ask(payload)
         if best_ask is not None:
             return float(best_ask)
+
+    return None
+
+
+def _fetch_market_min_order_size(client, token_id: str) -> Optional[float]:
+    """Retrieve the market minimum order size using documented CLOB endpoints."""
+
+    def _invoke(name: str, **kwargs):
+        fn = getattr(client, name, None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(**kwargs)
+        except TypeError:
+            return None
+        except Exception:
+            return None
+
+    book_resp = _invoke("get_order_book", token_id=token_id)
+    if book_resp is None:
+        book_resp = _invoke("get_order_book", market=token_id)
+    if book_resp is not None:
+        payload = book_resp[1] if isinstance(book_resp, tuple) and len(book_resp) == 2 else book_resp
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+            payload = payload.get("data")
+        extracted = _extract_min_order_size_from_book(payload)
+        if extracted is not None and extracted > 0:
+            return float(extracted)
+
+    books_resp = _invoke("get_order_books", token_ids=[token_id])
+    if books_resp is None:
+        books_resp = _invoke("get_order_books", markets=[token_id])
+    if books_resp is not None:
+        payload = books_resp[1] if isinstance(books_resp, tuple) and len(books_resp) == 2 else books_resp
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+            payload = payload.get("data")
+        extracted = _extract_min_order_size_from_book(payload)
+        if extracted is not None and extracted > 0:
+            return float(extracted)
+
+    markets_resp = _invoke("get_markets", ids=[token_id])
+    if markets_resp is not None:
+        payload = markets_resp[1] if isinstance(markets_resp, tuple) and len(markets_resp) == 2 else markets_resp
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+            payload = payload.get("data")
+        extracted = _extract_min_order_size_from_market(payload)
+        if extracted is not None and extracted > 0:
+            return float(extracted)
+
+    market_resp = _invoke("get_market", token_id=token_id)
+    if market_resp is None:
+        market_resp = _invoke("get_market", market=token_id)
+    if market_resp is not None:
+        payload = market_resp[1] if isinstance(market_resp, tuple) and len(market_resp) == 2 else market_resp
+        if isinstance(payload, MappingABC) and "data" in payload and "status" in payload:
+            payload = payload.get("data")
+        extracted = _extract_min_order_size_from_market(payload)
+        if extracted is not None and extracted > 0:
+            return float(extracted)
 
     return None
 
@@ -423,10 +552,20 @@ def execute_auto_buy(
     min_order_size: float = 0.0,
     tick_size: float = 0.0,
 ) -> ExecutionResult:
+    hinted_min_order = _coerce_float(min_order_size)
+    hinted_min_order = float(hinted_min_order) if hinted_min_order and hinted_min_order > 0 else 0.0
+    fetched_min_order = _fetch_market_min_order_size(client, token_id)
+    if fetched_min_order is not None and fetched_min_order > 0:
+        fetched_min_order = float(fetched_min_order)
+    else:
+        fetched_min_order = 0.0
+
+    effective_min_order = max(hinted_min_order, fetched_min_order)
+
     eff_price, eff_size, maker = _min_legal_pair(
         price,
         size,
-        minimum_size=min_order_size,
+        minimum_size=effective_min_order,
         tick_size=tick_size,
     )
     engine = _build_engine(client)
@@ -450,8 +589,12 @@ def execute_auto_buy(
     engine.config.min_quote_amount = float(min_quote_override)
 
     extra_flags = []
-    if min_order_size and min_order_size > 0:
-        extra_flags.append(f"min_order_size={min_order_size}")
+    if hinted_min_order > 0:
+        extra_flags.append(f"min_order_hint={hinted_min_order}")
+    if fetched_min_order > 0:
+        extra_flags.append(f"min_order_fetch={fetched_min_order}")
+    if effective_min_order > 0:
+        extra_flags.append(f"min_order_eff={effective_min_order}")
     if tick_size and tick_size > 0:
         extra_flags.append(f"tick_size={tick_size}")
     if best_ask is not None and best_ask > 0:
@@ -466,11 +609,6 @@ def execute_auto_buy(
     )
 
     try:
-        effective_min_order: Optional[float]
-        try:
-            effective_min_order = float(min_order_size)
-        except (TypeError, ValueError):
-            effective_min_order = None
         if effective_min_order and effective_min_order > 0:
             engine.config.min_market_order_size = effective_min_order
             if engine.config.order_slice_min < effective_min_order:
