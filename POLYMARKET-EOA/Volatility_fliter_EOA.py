@@ -62,6 +62,14 @@ get_rest_client = _import_rest_client()
 def _now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
+try:
+    from zoneinfo import ZoneInfo  # type: ignore
+except Exception:  # pragma: no cover - Python < 3.9 fallback
+    ZoneInfo = None  # type: ignore
+
+_EASTERN_ZONE = ZoneInfo("America/New_York") if ZoneInfo else dt.timezone(dt.timedelta(hours=-5))
+
+
 def _parse_dt(s: Optional[str]) -> Optional[dt.datetime]:
     if not s:
         return None
@@ -71,6 +79,35 @@ def _parse_dt(s: Optional[str]) -> Optional[dt.datetime]:
         return dt.datetime.fromisoformat(s)
     except Exception:
         return None
+
+
+def _parse_market_end(raw: Dict[str, Any]) -> Optional[dt.datetime]:
+    for key in ("endDate", "end_time", "endTime"):
+        val = raw.get(key)
+        if val:
+            break
+    else:
+        return None
+
+    val_str = str(val).strip()
+    if not val_str:
+        return None
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", val_str):
+        try:
+            target_date = dt.date.fromisoformat(val_str)
+        except ValueError:
+            return None
+        naive = dt.datetime.combine(target_date, dt.time(23, 59))
+        eastern = naive.replace(tzinfo=_EASTERN_ZONE)
+        return eastern.astimezone(dt.timezone.utc)
+
+    parsed = _parse_dt(val_str)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 def _coerce_float(x: Any) -> Optional[float]:
     try:
@@ -249,7 +286,7 @@ def fetch_markets_windowed(end_min: dt.datetime, end_max: dt.datetime, window_da
 def _is_arch_legacy_nonclob(raw: Dict[str, Any], legacy_end_days: int) -> bool:
     title = (raw.get("question") or raw.get("title") or "").strip()
     slug  = (raw.get("slug") or "").strip()
-    end   = _parse_dt(raw.get("endDate") or raw.get("end_time") or raw.get("endTime"))
+    end   = _parse_market_end(raw)
     clob_ids = raw.get("clobTokenIds") or raw.get("clob_token_ids") or raw.get("clobTokens")
 
     if title.upper().startswith("ARCH") or slug.lower().startswith("arch"):
@@ -274,7 +311,7 @@ def _parse_market(raw: Dict[str, Any]) -> MarketSnapshot:
     ms.closed = _coerce_bool(raw.get("closed"))
     ms.resolved = _coerce_bool(raw.get("resolved"))
     ms.acceptingOrders = _coerce_bool(raw.get("acceptingOrders"))
-    ms.end_time = _parse_dt(raw.get("endDate") or raw.get("end_time") or raw.get("endTime"))
+    ms.end_time = _parse_market_end(raw)
 
     ms.liquidity = _coerce_float(raw.get("liquidity") or raw.get("liquidity_num") or raw.get("liquidityNum") or raw.get("liquidityUsd") or raw.get("totalLiquidity"))
     ms.volume24h = _coerce_float(raw.get("volume24h") or raw.get("volume24Hr") or raw.get("volume24Hour") or raw.get("volume_24h") or raw.get("lastDayVolume"))
