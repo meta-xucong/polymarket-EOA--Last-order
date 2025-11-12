@@ -51,12 +51,13 @@ def _ensure_minimum_usdce_balance(client) -> bool:
     try:
         available = _fetch_available_quote_balance(client)
     except Exception as exc:  # pragma: no cover - 仅运行时提示
-        print(f"[WARN] 获取 USDC.e 余额失败：{exc}。将继续执行后续流程。")
-        return True
+        print(f"[ERR] 获取 USDC.e 余额失败：{exc}")
+        print("余额获取失败，请检查原因")
+        return False
 
     if available is None:
-        print("[WARN] 无法获取 USDC.e 余额，将继续执行后续流程。")
-        return True
+        print("余额获取失败，请检查原因")
+        return False
 
     print(f"[INFO] 当前 USDC.e 可用余额：{available:.4f}")
     if available + 1e-9 < _MIN_USDCE_BALANCE:
