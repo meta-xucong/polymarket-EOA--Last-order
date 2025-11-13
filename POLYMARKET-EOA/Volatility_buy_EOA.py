@@ -238,6 +238,45 @@ def _min_legal_pair(
     return float(p), float(eff_size), float(maker)
 
 
+def _iter_error_strings(payload: Any):
+    if payload is None:
+        return
+    if isinstance(payload, (str, bytes, bytearray)):
+        try:
+            yield payload.decode("utf-8") if isinstance(payload, (bytes, bytearray)) else payload
+        except Exception:
+            yield str(payload)
+        return
+    if isinstance(payload, MappingABC):
+        for value in payload.values():
+            yield from _iter_error_strings(value)
+        return
+    if isinstance(payload, IterableABC) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            yield from _iter_error_strings(item)
+        return
+    yield str(payload)
+
+
+def _is_min_size_violation_error(exc: BaseException) -> bool:
+    candidates = []
+    for attr in ("error_message", "message", "detail", "data"):
+        if hasattr(exc, attr):
+            candidates.append(getattr(exc, attr))
+    if getattr(exc, "args", None):
+        candidates.extend(exc.args)
+    candidates.append(str(exc))
+
+    for candidate in candidates:
+        for text in _iter_error_strings(candidate):
+            lowered = str(text).lower()
+            if "lower than the minimum" in lowered:
+                return True
+            if "minimum" in lowered and "size" in lowered and "invalid" in lowered:
+                return True
+    return False
+
+
 def _extract_best_ask(payload: Any) -> Optional[float]:
     numeric = _coerce_float(payload)
     if numeric is not None:
@@ -735,14 +774,6 @@ def execute_auto_buy(
     else:
         fetched_min_quote = 0.0
 
-    effective_min_order = max(hinted_min_order, fetched_min_order)
-
-    eff_price, eff_size, maker = _min_legal_pair(
-        price,
-        size,
-        minimum_size=effective_min_order,
-        tick_size=tick_size,
-    )
     engine = _build_engine(client)
 
     original_min_market = getattr(engine.config, "min_market_order_size", 0.0)
@@ -750,125 +781,149 @@ def execute_auto_buy(
     original_slice_min = engine.config.order_slice_min
     original_slice_max = engine.config.order_slice_max
 
-    if fetched_min_quote > 0:
-        min_quote_floor = fetched_min_quote
-    elif original_min_quote and original_min_quote > 0:
-        min_quote_floor = float(original_min_quote)
-    else:
-        min_quote_floor = 1.0
     best_ask = _fetch_best_ask_price(client, token_id)
-    size_dec, min_quote_override = _enforce_market_minimums(
-        eff_price,
-        eff_size,
-        best_ask=best_ask,
-        tick_size=tick_size,
-        min_quote=min_quote_floor,
-    )
-    eff_size = float(size_dec)
-    maker = float(_q2_up(Decimal(str(eff_price)) * size_dec))
-    engine.config.min_quote_amount = float(min_quote_override)
 
-    extra_flags = []
-    if hinted_min_order > 0:
-        extra_flags.append(f"min_order_hint={hinted_min_order}")
-    if fetched_min_order > 0:
-        extra_flags.append(f"min_order_fetch={fetched_min_order}")
-    if fetched_min_quote > 0:
-        extra_flags.append(f"min_quote_fetch={fetched_min_quote}")
-    if min_fetch_source:
-        extra_flags.append(f"min_fetch_src={min_fetch_source}")
-    if effective_min_order > 0:
-        extra_flags.append(f"min_order_eff={effective_min_order}")
-    if tick_size and tick_size > 0:
-        extra_flags.append(f"tick_size={tick_size}")
-    if best_ask is not None and best_ask > 0:
-        extra_flags.append(f"best_ask={best_ask}")
-    min_quote_effective = float(min_quote_override)
-    if original_min_quote is None or min_quote_effective > float(original_min_quote) + 1e-9:
-        extra_flags.append(f"min_quote_eff={min_quote_effective}")
-    tail = f" | {' '.join(extra_flags)}" if extra_flags else ""
-    print(
-        "[Volatility_buy_EOA] 规范化 -> "
-        f"base_price={price} | hint_size={size} | eff_price={eff_price} | eff_size={eff_size} | maker={maker}" + tail
-    )
+    def _attempt(use_fetched_min_size: bool) -> ExecutionResult:
+        effective_min_order = hinted_min_order
+        if use_fetched_min_size:
+            effective_min_order = max(effective_min_order, fetched_min_order)
+
+        eff_price, eff_size, maker = _min_legal_pair(
+            price,
+            size,
+            minimum_size=effective_min_order,
+            tick_size=tick_size,
+        )
+
+        if fetched_min_quote > 0:
+            min_quote_floor = fetched_min_quote
+        elif original_min_quote and original_min_quote > 0:
+            min_quote_floor = float(original_min_quote)
+        else:
+            min_quote_floor = 1.0
+
+        size_dec, min_quote_override = _enforce_market_minimums(
+            eff_price,
+            eff_size,
+            best_ask=best_ask,
+            tick_size=tick_size,
+            min_quote=min_quote_floor,
+        )
+        eff_size_attempt = float(size_dec)
+        maker_attempt = float(_q2_up(Decimal(str(eff_price)) * size_dec))
+        engine.config.min_quote_amount = float(min_quote_override)
+
+        extra_flags = []
+        if hinted_min_order > 0:
+            extra_flags.append(f"min_order_hint={hinted_min_order}")
+        if fetched_min_order > 0:
+            extra_flags.append(f"min_order_fetch={fetched_min_order}")
+        if fetched_min_quote > 0:
+            extra_flags.append(f"min_quote_fetch={fetched_min_quote}")
+        if min_fetch_source:
+            extra_flags.append(f"min_fetch_src={min_fetch_source}")
+        if effective_min_order > 0:
+            extra_flags.append(f"min_order_eff={effective_min_order}")
+        if tick_size and tick_size > 0:
+            extra_flags.append(f"tick_size={tick_size}")
+        if best_ask is not None and best_ask > 0:
+            extra_flags.append(f"best_ask={best_ask}")
+        min_quote_effective = float(min_quote_override)
+        if original_min_quote is None or min_quote_effective > float(original_min_quote) + 1e-9:
+            extra_flags.append(f"min_quote_eff={min_quote_effective}")
+        tail = f" | {' '.join(extra_flags)}" if extra_flags else ""
+        print(
+            "[Volatility_buy_EOA] 规范化 -> "
+            f"base_price={price} | hint_size={size} | eff_price={eff_price} | eff_size={eff_size_attempt} | maker={maker_attempt}" + tail
+        )
+
+        try:
+            if effective_min_order and effective_min_order > 0:
+                engine.config.min_market_order_size = effective_min_order
+                if engine.config.order_slice_min < effective_min_order:
+                    engine.config.order_slice_min = effective_min_order
+                if engine.config.order_slice_max < engine.config.order_slice_min:
+                    engine.config.order_slice_max = engine.config.order_slice_min
+
+            available_quote = _fetch_available_quote_balance(client)
+            if available_quote is not None:
+                try:
+                    slice_plan = list(
+                        engine._slice_quantities(
+                            float(eff_size_attempt), side="buy", price=float(eff_price)
+                        )
+                    )
+                except Exception:
+                    slice_plan = [float(eff_size_attempt)]
+                slice_plan = [s for s in slice_plan if s and s > 0]
+                first_slice = slice_plan[0] if slice_plan else float(eff_size_attempt)
+                min_quote_needed = float(eff_price) * first_slice
+                total_quote_needed = float(eff_price) * float(eff_size_attempt)
+                eps = 1e-9
+
+                if available_quote + eps < min_quote_needed:
+                    print(
+                        f"[Volatility_buy_EOA] 余额 {available_quote:.4f} USDC 低于最小下单需求 {min_quote_needed:.4f}，跳过本次买入。"
+                    )
+                    return ExecutionResult(
+                        side="buy",
+                        requested=float(eff_size_attempt),
+                        filled=0.0,
+                        last_price=float(eff_price),
+                        attempts=0,
+                        status="SKIPPED",
+                        message=(
+                            f"INSUFFICIENT_FUNDS_MIN_SLICE(required={min_quote_needed:.4f}, available={available_quote:.4f})"
+                        ),
+                        avg_price=None,
+                        limit_price=float(eff_price),
+                    )
+
+                if available_quote + eps < total_quote_needed:
+                    print(
+                        f"[Volatility_buy_EOA] 余额 {available_quote:.4f} USDC 无法覆盖本次买入所需 {total_quote_needed:.4f}，跳过本次买入。"
+                    )
+                    return ExecutionResult(
+                        side="buy",
+                        requested=float(eff_size_attempt),
+                        filled=0.0,
+                        last_price=float(eff_price),
+                        attempts=0,
+                        status="SKIPPED",
+                        message=(
+                            f"INSUFFICIENT_FUNDS_TOTAL(required={total_quote_needed:.4f}, available={available_quote:.4f})"
+                        ),
+                        avg_price=None,
+                        limit_price=float(eff_price),
+                    )
+
+            result = engine.execute_buy(
+                token_id=str(token_id),
+                price=float(eff_price),
+                quantity=float(eff_size_attempt),
+            )
+        finally:
+            engine.config.min_market_order_size = original_min_market
+            engine.config.min_quote_amount = original_min_quote
+            engine.config.order_slice_min = original_slice_min
+            engine.config.order_slice_max = original_slice_max
+
+        print(
+            "[Volatility_buy_EOA] 执行结果 -> "
+            f"status={result.status} filled={result.filled} requested={result.requested} "
+            f"price={result.last_price} limit={result.limit_price}"
+        )
+        return result
 
     try:
-        if effective_min_order and effective_min_order > 0:
-            engine.config.min_market_order_size = effective_min_order
-            if engine.config.order_slice_min < effective_min_order:
-                engine.config.order_slice_min = effective_min_order
-            if engine.config.order_slice_max < engine.config.order_slice_min:
-                engine.config.order_slice_max = engine.config.order_slice_min
-
-        available_quote = _fetch_available_quote_balance(client)
-        if available_quote is not None:
-            try:
-                slice_plan = list(
-                    engine._slice_quantities(
-                        float(eff_size), side="buy", price=float(eff_price)
-                    )
-                )
-            except Exception:
-                slice_plan = [float(eff_size)]
-            slice_plan = [s for s in slice_plan if s and s > 0]
-            first_slice = slice_plan[0] if slice_plan else float(eff_size)
-            min_quote_needed = float(eff_price) * first_slice
-            total_quote_needed = float(eff_price) * float(eff_size)
-            eps = 1e-9
-
-            if available_quote + eps < min_quote_needed:
-                print(
-                    f"[Volatility_buy_EOA] 余额 {available_quote:.4f} USDC 低于最小下单需求 {min_quote_needed:.4f}，跳过本次买入。"
-                )
-                return ExecutionResult(
-                    side="buy",
-                    requested=float(eff_size),
-                    filled=0.0,
-                    last_price=float(eff_price),
-                    attempts=0,
-                    status="SKIPPED",
-                    message=(
-                        f"INSUFFICIENT_FUNDS_MIN_SLICE(required={min_quote_needed:.4f}, available={available_quote:.4f})"
-                    ),
-                    avg_price=None,
-                    limit_price=float(eff_price),
-                )
-
-            if available_quote + eps < total_quote_needed:
-                print(
-                    f"[Volatility_buy_EOA] 余额 {available_quote:.4f} USDC 无法覆盖本次买入所需 {total_quote_needed:.4f}，跳过本次买入。"
-                )
-                return ExecutionResult(
-                    side="buy",
-                    requested=float(eff_size),
-                    filled=0.0,
-                    last_price=float(eff_price),
-                    attempts=0,
-                    status="SKIPPED",
-                    message=(
-                        f"INSUFFICIENT_FUNDS_TOTAL(required={total_quote_needed:.4f}, available={available_quote:.4f})"
-                    ),
-                    avg_price=None,
-                    limit_price=float(eff_price),
-                )
-
-        result = engine.execute_buy(
-            token_id=str(token_id),
-            price=float(eff_price),
-            quantity=float(eff_size),
-        )
-    finally:
-        engine.config.min_market_order_size = original_min_market
-        engine.config.min_quote_amount = original_min_quote
-        engine.config.order_slice_min = original_slice_min
-        engine.config.order_slice_max = original_slice_max
-
-    print(
-        "[Volatility_buy_EOA] 执行结果 -> "
-        f"status={result.status} filled={result.filled} requested={result.requested} "
-        f"price={result.last_price} limit={result.limit_price}"
-    )
-    return result
+        return _attempt(use_fetched_min_size=False)
+    except Exception as exc:
+        if fetched_min_order > 0 and _is_min_size_violation_error(exc):
+            print(
+                "[Volatility_buy_EOA] 检测到最小份数拒单，按照 Gamma 最小份数重新尝试下单……"
+            )
+            return _attempt(use_fetched_min_size=True)
+        raise
 
 
 __all__ = ["execute_auto_buy"]
