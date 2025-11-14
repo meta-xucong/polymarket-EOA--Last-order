@@ -24,7 +24,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 import requests
 
@@ -58,6 +58,7 @@ except Exception:  # pragma: no cover - 回退到最少依赖
 DATA_API_HOST = os.environ.get("DATA_API_HOST", _VP_DATA_API_HOST).rstrip("/")
 GAMMA_API_HOST = os.environ.get("GAMMA_API_HOST", "https://gamma-api.polymarket.com").rstrip("/")
 GAMMA_ALT_HOST = os.environ.get("GAMMA_ALT_HOST", "https://gamma.polymarket.com").rstrip("/")
+MARKET_LOOKUP_HOSTS = [host for host in (GAMMA_API_HOST, GAMMA_ALT_HOST) if host]
 
 DEFAULT_SINCE_DATE = "2025-11-13"
 UTC_PLUS_8 = timezone(timedelta(hours=8))
@@ -79,19 +80,205 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _extract_items(payload: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """容错解析 Data-API 返回的 list + cursor。"""
-    print(f"[DEBUG] API 返回数据：{payload}")  # 打印返回的原始数据
+
+    cursor: Optional[str] = None
+
+    def _extract_cursor(raw: Dict[str, Any]) -> Optional[str]:
+        for key in ("next", "nextCursor", "next_page", "nextPage", "cursor"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
     if isinstance(payload, list):
         return [it for it in payload if isinstance(it, dict)], None
+
     if isinstance(payload, dict):
         for key in ("data", "results", "items", "fills", "positions", "history"):
             arr = payload.get(key)
             if isinstance(arr, list):
+                cursor = _extract_cursor(payload)
                 break
         else:
             arr = []
-        return [it for it in arr if isinstance(it, dict)], None
+            cursor = _extract_cursor(payload)
+        return [it for it in arr if isinstance(it, dict)], cursor
+
     return [], None
 
+
+def _coerce_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                return []
+        return [text]
+    return []
+
+
+def _extract_clob_ids(raw: Dict[str, Any]) -> List[str]:
+    candidates = (
+        raw.get("clobTokenIds"),
+        raw.get("clob_token_ids"),
+        raw.get("clobTokens"),
+        raw.get("tokenIds"),
+    )
+    for cand in candidates:
+        arr = [str(x).strip() for x in _coerce_list(cand) if str(x).strip()]
+        if arr:
+            return arr
+    return []
+
+
+def _extract_outcome_names(raw: Dict[str, Any]) -> List[str]:
+    candidates = (
+        raw.get("outcomes"),
+        raw.get("outcomeNames"),
+        raw.get("outcome_names"),
+        raw.get("outcomeLabels"),
+        raw.get("outcome_labels"),
+    )
+    for cand in candidates:
+        arr = [str(x).strip() for x in _coerce_list(cand) if str(x).strip()]
+        if arr:
+            return arr
+    return []
+
+
+_MARKET_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+
+
+def _fetch_market_by_token(token_id: str) -> Optional[Dict[str, Any]]:
+    token_id = str(token_id or "").strip()
+    if not token_id:
+        return None
+    cached = _MARKET_CACHE.get(token_id)
+    if cached is not None:
+        return cached
+    for host in MARKET_LOOKUP_HOSTS:
+        if not host:
+            continue
+        try:
+            resp = requests.get(
+                f"{host}/markets",
+                params={"clob_token_ids": token_id},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            items, _ = _extract_items(resp.json())
+        except Exception:
+            continue
+        if not items:
+            continue
+        market = items[0]
+        _MARKET_CACHE[token_id] = market
+        return market
+    _MARKET_CACHE[token_id] = None
+    return None
+
+
+def _lookup_markets_for_assets(assets: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    seen: Set[str] = set()
+    for asset in assets:
+        token_id = str(asset or "").strip()
+        if not token_id or token_id in seen:
+            continue
+        seen.add(token_id)
+        market = _fetch_market_by_token(token_id)
+        if market:
+            out[token_id] = market
+    return out
+
+
+def _normalize_outcome_name(text: Any) -> str:
+    if text is None:
+        return ""
+    normalized = str(text).strip().lower()
+    if normalized in {"yes", "y", "1", "true"}:
+        return "yes"
+    if normalized in {"no", "n", "0", "false"}:
+        return "no"
+    return normalized
+
+
+def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    meta = {
+        "token_index": None,
+        "token_label": "",
+        "token_side": "",
+        "market_win_outcome": "",
+        "market_slug": "",
+        "market_title": "",
+    }
+    if not market:
+        return meta
+
+    meta["market_slug"] = (
+        market.get("slug")
+        or market.get("marketSlug")
+        or market.get("conditionSlug")
+        or ""
+    )
+    meta["market_title"] = (
+        market.get("question")
+        or market.get("title")
+        or market.get("name")
+        or meta["market_title"]
+    )
+    meta["market_win_outcome"] = (
+        market.get("winningOutcome")
+        or market.get("resolvedOutcome")
+        or market.get("resolveOutcome")
+        or market.get("result")
+        or ""
+    )
+
+    clob_ids = _extract_clob_ids(market)
+    outcome_names = _extract_outcome_names(market)
+    asset_str = str(asset or "").strip()
+    if asset_str and clob_ids and asset_str in clob_ids:
+        idx = clob_ids.index(asset_str)
+        meta["token_index"] = idx
+        if idx < len(outcome_names):
+            meta["token_label"] = outcome_names[idx]
+        elif idx == 0:
+            meta["token_label"] = "Yes"
+        elif idx == 1:
+            meta["token_label"] = "No"
+    tokens_obj = market.get("tokens") or market.get("tokenInfo") or market.get("token_info")
+    token_entries: List[Dict[str, Any]] = []
+    if isinstance(tokens_obj, list):
+        token_entries = [t for t in tokens_obj if isinstance(t, dict)]
+    elif isinstance(tokens_obj, dict):
+        token_entries = [t for t in tokens_obj.values() if isinstance(t, dict)]
+    for entry in token_entries:
+        tid = entry.get("tokenId") or entry.get("token_id") or entry.get("id")
+        tid = str(tid or "").strip()
+        if tid and tid == asset_str:
+            meta["token_label"] = (
+                entry.get("outcome")
+                or entry.get("outcomeName")
+                or entry.get("name")
+                or entry.get("label")
+                or meta["token_label"]
+            )
+            meta["token_side"] = entry.get("type") or entry.get("side") or entry.get("position") or ""
+            break
+    return meta
 
 def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
     """拉取用户的历史成交数据，分页获取"""
@@ -99,6 +286,12 @@ def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]
     trades_endpoint = f"{DATA_API_HOST}/trades"
     params = {"user": user, "limit": limit}
     return _paginate(trades_endpoint, params, max_pages)
+
+
+def _fetch_activity(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
+    endpoint = f"{DATA_API_HOST}/activity"
+    params = {"user": user, "limit": limit}
+    return _paginate(endpoint, params, max_pages)
 
 
 def _paginate(endpoint: str, params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
@@ -216,6 +409,160 @@ def _entry_timestamp(entry: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _extract_asset_id(entry: Dict[str, Any]) -> str:
+    for key in ("asset", "tokenId", "token_id", "tokenID", "id"):
+        value = entry.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    token = entry.get("token")
+    if isinstance(token, dict):
+        for key in ("tokenId", "id", "asset"):
+            value = token.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _extract_cash_pnl(entry: Dict[str, Any]) -> Optional[float]:
+    for key in (
+        "cashPnl",
+        "cashPnlTotal",
+        "realizedPnl",
+        "realizedPnL",
+        "pnl",
+        "PnL",
+        "profit",
+        "payout",
+    ):
+        if key in entry:
+            val = _safe_float(entry.get(key))
+            return val
+    return None
+
+
+@dataclass
+class BuyPosition:
+    asset: str
+    title: str = ""
+    outcome: str = ""
+    market_slug: str = ""
+    condition_id: str = ""
+    icon: str = ""
+    total_size: float = 0.0
+    total_cost: float = 0.0
+    first_ts: Optional[float] = None
+    last_ts: Optional[float] = None
+
+    def register_trade(self, trade: Dict[str, Any], size: float, price: float, ts: Optional[float]) -> None:
+        if size <= 0:
+            return
+        self.total_size += size
+        self.total_cost += size * price
+        if not self.title:
+            self.title = (
+                trade.get("title")
+                or trade.get("market")
+                or trade.get("eventSlug")
+                or trade.get("slug")
+                or ""
+            )
+        if not self.outcome:
+            self.outcome = trade.get("outcome") or trade.get("outcomeName") or ""
+        if not self.market_slug:
+            self.market_slug = trade.get("slug") or trade.get("marketSlug") or trade.get("eventSlug") or ""
+        if not self.condition_id:
+            self.condition_id = trade.get("conditionId") or trade.get("condition_id") or ""
+        if not self.icon:
+            self.icon = trade.get("icon") or ""
+        if ts is not None:
+            if self.first_ts is None or ts < self.first_ts:
+                self.first_ts = ts
+            if self.last_ts is None or ts > self.last_ts:
+                self.last_ts = ts
+
+    @property
+    def avg_price(self) -> float:
+        if self.total_size <= 0:
+            return 0.0
+        return self.total_cost / self.total_size
+
+
+def _summarize_buy_trades(trades: Iterable[Dict[str, Any]]) -> Dict[str, BuyPosition]:
+    summary: Dict[str, BuyPosition] = {}
+    for trade in trades:
+        side = (trade.get("side") or "").upper()
+        if side != "BUY":
+            continue
+        asset = _extract_asset_id(trade)
+        if not asset:
+            continue
+        size = _safe_float(trade.get("size"))
+        price = _safe_float(trade.get("price"))
+        if size <= 0:
+            continue
+        ts = _entry_timestamp(trade)
+        bucket = summary.get(asset)
+        if bucket is None:
+            bucket = BuyPosition(asset=asset)
+            summary[asset] = bucket
+        bucket.register_trade(trade, size, price, ts)
+    return summary
+
+
+def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for entry in entries:
+        asset = _extract_asset_id(entry)
+        if not asset:
+            continue
+        ts = _entry_timestamp(entry)
+        info = {
+            "asset": asset,
+            "status": entry.get("status") or entry.get("type") or entry.get("action") or "",
+            "resolved_outcome": entry.get("winningOutcome")
+            or entry.get("resolvedOutcome")
+            or entry.get("outcome")
+            or entry.get("result"),
+            "cash_pnl": _extract_cash_pnl(entry),
+            "claim_amount": _safe_float(
+                entry.get("claimAmount")
+                or entry.get("amountClaimed")
+                or entry.get("claimedAmount")
+            ),
+            "settlement_price": _safe_float(
+                entry.get("settlementPrice")
+                or entry.get("settledPrice")
+                or entry.get("resolvePrice")
+            ),
+            "timestamp": ts,
+            "was_claimed": bool(
+                entry.get("claimed")
+                or entry.get("isClaimed")
+                or entry.get("wasClaimed")
+                or (entry.get("type") or "").lower() == "claim"
+                or (entry.get("action") or "").lower() == "claim"
+            ),
+            "raw": entry,
+        }
+        info["is_resolved"] = bool(
+            entry.get("resolved")
+            or entry.get("isResolved")
+            or entry.get("status") == "resolved"
+            or (entry.get("type") or "").lower() in ("claim", "resolve")
+        )
+        prev = resolved.get(asset)
+        prev_ts = prev.get("timestamp") if prev else None
+        if prev is None or (ts is not None and (prev_ts is None or ts >= prev_ts)):
+            resolved[asset] = info
+    return resolved
+
+
 def _fmt_timestamp_local(ts: Optional[float]) -> str:
     if ts is None:
         return "-"
@@ -241,10 +588,88 @@ def _prompt_since_date() -> Tuple[str, float]:
     )
     user_input = input(prompt)
     date_text = (user_input or "").strip() or DEFAULT_SINCE_DATE
-    base_date = datetime.strptime(date_text, "%Y-%m-%d")
+    try:
+        base_date = datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        print(f"[WARN] 无法解析日期 '{date_text}'，回退到默认 {DEFAULT_SINCE_DATE}。")
+        date_text = DEFAULT_SINCE_DATE
+        base_date = datetime.strptime(date_text, "%Y-%m-%d")
     aware_dt = base_date.replace(tzinfo=UTC_PLUS_8)
     since_ts = aware_dt.astimezone(timezone.utc).timestamp()  # 强制转换为秒（UTC）
     return date_text, since_ts
+
+
+def _compose_position_rows(
+    positions: Dict[str, BuyPosition],
+    realized: Dict[str, Dict[str, Any]],
+    markets: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for asset, bucket in positions.items():
+        realized_entry = realized.get(asset)
+        resolved_ts = realized_entry.get("timestamp") if realized_entry else None
+        market_meta = markets.get(asset)
+        token_meta = _resolve_token_meta(asset, market_meta)
+        activity_outcome = (
+            realized_entry.get("resolved_outcome") if realized_entry else None
+        )
+        resolved_outcome = activity_outcome or token_meta.get("market_win_outcome") or None
+        rows.append(
+            {
+                "asset": asset,
+                "title": bucket.title or token_meta.get("market_title") or "",
+                "outcome": bucket.outcome or token_meta.get("token_label") or "",
+                "marketSlug": bucket.market_slug or token_meta.get("market_slug") or "",
+                "conditionId": bucket.condition_id,
+                "icon": bucket.icon,
+                "totalSize": bucket.total_size,
+                "avgEntryPrice": bucket.avg_price,
+                "totalCost": bucket.total_cost,
+                "firstBuyTime": bucket.first_ts,
+                "lastBuyTime": bucket.last_ts,
+                "resolutionTime": resolved_ts,
+                "resolutionStatus": realized_entry.get("status") if realized_entry else None,
+                "resolvedOutcome": resolved_outcome,
+                "resolvedOutcomeSource": "activity"
+                if activity_outcome
+                else ("market" if resolved_outcome else None),
+                "realizedPnl": realized_entry.get("cash_pnl") if realized_entry else None,
+                "claimAmount": realized_entry.get("claim_amount") if realized_entry else None,
+                "settlementPrice": realized_entry.get("settlement_price") if realized_entry else None,
+                "isResolved": bool(
+                    (realized_entry.get("is_resolved") if realized_entry else None)
+                    or resolved_outcome
+                ),
+                "wasClaimed": realized_entry.get("was_claimed") if realized_entry else False,
+                "tokenOutcomeLabel": token_meta.get("token_label") or bucket.outcome or "",
+                "tokenOutcomeIndex": token_meta.get("token_index"),
+                "tokenOutcomeSide": token_meta.get("token_side") or "",
+            }
+        )
+    for row in rows:
+        settlement_price = row.get("settlementPrice")
+        total_size = row.get("totalSize") or 0.0
+        total_cost = row.get("totalCost") or 0.0
+        payout = None
+        derived_pnl = None
+        outcome_match = None
+        if isinstance(settlement_price, (int, float)):
+            payout = total_size * float(settlement_price)
+            derived_pnl = payout - total_cost
+        else:
+            token_outcome = row.get("tokenOutcomeLabel")
+            resolved_outcome = row.get("resolvedOutcome")
+            norm_token = _normalize_outcome_name(token_outcome)
+            norm_resolved = _normalize_outcome_name(resolved_outcome)
+            if norm_token and norm_resolved:
+                outcome_match = norm_token == norm_resolved
+                payout = total_size if outcome_match else 0.0
+                derived_pnl = payout - total_cost
+        row["derivedPayout"] = payout
+        row["derivedPnl"] = derived_pnl
+        row["derivedOutcomeMatch"] = outcome_match
+    rows.sort(key=lambda r: (r.get("lastBuyTime") or 0), reverse=True)
+    return rows
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -301,26 +726,93 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERR] 获取历史成交失败：{exc}", file=sys.stderr)
         return 4
 
-    # Filter trades since the specified date
+    try:
+        history_entries = _fetch_activity(
+            user,
+            limit=max(1, args.history_limit),
+            max_pages=max(1, args.history_pages),
+        )
+    except Exception as exc:
+        print(f"[WARN] 获取历史仓位 /activity 失败：{exc}")
+        history_entries = []
+
     filtered_trades = _filter_entries_since(trades, since_ts)
+    filtered_history = _filter_entries_since(history_entries, since_ts)
+
+    buy_positions = _summarize_buy_trades(filtered_trades)
+    realized_map = _summarize_activity(filtered_history)
+    market_meta = _lookup_markets_for_assets(buy_positions.keys())
+    rows = _compose_position_rows(buy_positions, realized_map, market_meta)
 
     if args.json:
-        # Output the filtered trades in JSON format
         output = {
             "wallet": user,
             "since_date_utc8": since_date_text,
+            "positions": rows,
             "trades": filtered_trades,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
 
-    # Output formatted trade summary
-    print("[TRADES] 历史成交统计：")
-    for trade in filtered_trades:
-        print(
-            f"交易方向: {trade['side']} | 资产: {trade['asset']} | "
-            f"买入价格: {trade['price']} | 时间戳: {trade['timestamp']} | 市场结算结果: {trade['outcome']}"
+    if not rows:
+        print("[INFO] 在指定区间内没有买入记录。")
+        return 0
+
+    print("\n[HISTORY] 历史买入持仓（含结算盈亏）：")
+    for idx, row in enumerate(rows, 1):
+        total_size = row.get("totalSize") or 0.0
+        avg_price = row.get("avgEntryPrice") or 0.0
+        total_cost = row.get("totalCost") or 0.0
+        realized_pnl = row.get("realizedPnl")
+        claim_amount = row.get("claimAmount")
+        resolution_status = row.get("resolutionStatus")
+        if not resolution_status:
+            resolution_status = "已结算" if row.get("isResolved") else "未结算"
+        resolved_outcome = row.get("resolvedOutcome") or "-"
+        first_ts = _fmt_timestamp_local(row.get("firstBuyTime"))
+        last_ts = _fmt_timestamp_local(row.get("lastBuyTime"))
+        resolution_time = _fmt_timestamp_local(row.get("resolutionTime"))
+        realized_text = (
+            _vp_fmt_money(realized_pnl) if isinstance(realized_pnl, (int, float)) else "-"
         )
+        claim_text = (
+            _vp_fmt_money(claim_amount) if isinstance(claim_amount, (int, float)) else "-"
+        )
+        token_label = row.get("tokenOutcomeLabel") or "-"
+        token_index = row.get("tokenOutcomeIndex")
+        token_side = row.get("tokenOutcomeSide") or ""
+        option_desc = token_label
+        if token_index is not None:
+            option_desc = f"{option_desc} (idx={token_index})"
+        if token_side:
+            option_desc = f"{option_desc} [{token_side}]"
+        print(
+            f"{idx:>2}. {row.get('title') or '-'} | {row.get('outcome') or '-'} | token_id={row.get('asset')}"
+        )
+        print(
+            "    "
+            f"买入方向=BUY | 买入总量={total_size:.4f} | 均价={_vp_fmt_money(avg_price)} | 总成本≈{_vp_fmt_money(total_cost)}"
+        )
+        print(f"    买入选项={option_desc}")
+        print(f"    买入时间区间：{first_ts} -> {last_ts}")
+        print(
+            "    "
+            f"结算状态={resolution_status} | 结算结果={resolved_outcome} | 已实现盈亏={realized_text} | 结算时间={resolution_time}"
+        )
+        print(f"    领取金额/赔付={claim_text}")
+        derived_payout = row.get("derivedPayout")
+        derived_pnl = row.get("derivedPnl")
+        outcome_match = row.get("derivedOutcomeMatch")
+        if isinstance(derived_pnl, (int, float)) and isinstance(derived_payout, (int, float)):
+            payout_text = _vp_fmt_money(derived_payout)
+            derived_text = _vp_fmt_money(derived_pnl)
+            match_text = "命中" if outcome_match else "失利"
+            print(
+                "    "
+                f"推导结算：{match_text} | 理论赔付≈{payout_text} | 推导盈亏≈{derived_text}"
+            )
+        else:
+            print("    推导结算：-")
 
     return 0
 
