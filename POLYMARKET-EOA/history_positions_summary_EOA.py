@@ -5,7 +5,7 @@
 功能概览：
 1. 自动识别当前钱包地址（沿用 ``view_positions_EOA.py`` 的逻辑）。
 2. 拉取 Data-API ``/positions`` 查看当前持仓。
-3. 统计 ``/fills`` 返回的历史成交（买入数量 / 金额 / 均价等）。
+3. 统计 Data-API ``/trades`` 返回的历史成交（买入数量 / 金额 / 均价等）。
 4. 汇总 ``/positions/history``（或 ``/positions-history``）返回的历史仓位已实现 PnL，
    并列出“已 claim 且价格归零”的市场以便复核。
 
@@ -53,6 +53,8 @@ except Exception:  # pragma: no cover - 回退到最少依赖
 
 
 DATA_API_HOST = os.environ.get("DATA_API_HOST", _VP_DATA_API_HOST).rstrip("/")
+GAMMA_API_HOST = os.environ.get("GAMMA_API_HOST", "https://gamma-api.polymarket.com").rstrip("/")
+GAMMA_ALT_HOST = os.environ.get("GAMMA_ALT_HOST", "https://gamma.polymarket.com").rstrip("/")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -111,9 +113,78 @@ def _paginate(endpoint: str, params: Dict[str, Any], max_pages: int) -> List[Dic
     return out
 
 
-def _fetch_fills(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
-    params = {"user": user, "limit": limit}
-    return _paginate(f"{DATA_API_HOST}/fills", params, max_pages)
+def _paginate_offset(
+    endpoint: str, params: Dict[str, Any], limit: int, max_pages: int
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    offset = 0
+    for _ in range(max_pages):
+        q = dict(params)
+        q["limit"] = limit
+        if offset:
+            q["offset"] = offset
+        resp = requests.get(endpoint, params=q, timeout=20)
+        resp.raise_for_status()
+        items, _ = _extract_items(resp.json())
+        if not items:
+            break
+        out.extend(items)
+        if len(items) < limit:
+            break
+        offset += limit
+    return out
+
+
+def _trade_history_endpoints() -> List[str]:
+    hosts = [DATA_API_HOST, GAMMA_API_HOST, GAMMA_ALT_HOST]
+    paths = [
+        "/trades",
+        "/trades/history",
+        "/trades-history",
+        "/fills",
+        "/fills/history",
+        "/fills-history",
+    ]
+    endpoints: List[str] = []
+    for host in hosts:
+        if not host:
+            continue
+        base = host.rstrip("/")
+        for path in paths:
+            endpoint = f"{base}{path}"
+            if endpoint not in endpoints:
+                endpoints.append(endpoint)
+    return endpoints
+
+
+def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
+    capped_limit = max(1, min(limit, 10000))
+    trade_params = {"user": user, "takerOnly": False}
+    alias_params = {
+        "limit": capped_limit,
+        "user": user,
+        "wallet": user,
+        "walletAddress": user,
+        "address": user,
+    }
+    last_error: Optional[Exception] = None
+    for endpoint in _trade_history_endpoints():
+        try:
+            if endpoint.endswith("/trades") or endpoint.endswith("/trades/history") or endpoint.endswith("/trades-history"):
+                return _paginate_offset(endpoint, trade_params, capped_limit, max_pages)
+            return _paginate(endpoint, alias_params, max_pages)
+        except requests.HTTPError as exc:  # pragma: no cover - 网络异常仅运行时触发
+            last_error = exc
+            status = getattr(exc.response, "status_code", None)
+            if status in {404, 405}:
+                continue
+            raise
+        except Exception as exc:  # pragma: no cover
+            last_error = exc
+            continue
+    if last_error:
+        raise last_error
+    return []
 
 
 def _fetch_positions_history(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
@@ -140,8 +211,8 @@ def _fetch_positions_history(user: str, limit: int, max_pages: int) -> List[Dict
 
 
 @dataclass
-class FillSummary:
-    fills_count: int
+class TradeSummary:
+    trades_count: int
     buy_count: int
     buy_volume: float
     buy_notional: float
@@ -162,7 +233,7 @@ class FillSummary:
         return self.sell_notional / self.sell_volume
 
 
-def _summarize_fills(fills: Iterable[Dict[str, Any]]) -> FillSummary:
+def _summarize_trades(fills: Iterable[Dict[str, Any]]) -> TradeSummary:
     buy_volume = buy_notional = sell_volume = sell_notional = 0.0
     total = buy_count = sell_count = 0
     for fill in fills:
@@ -180,8 +251,8 @@ def _summarize_fills(fills: Iterable[Dict[str, Any]]) -> FillSummary:
             sell_count += 1
             sell_volume += size
             sell_notional += size * price
-    return FillSummary(
-        fills_count=total,
+    return TradeSummary(
+        trades_count=total,
         buy_count=buy_count,
         buy_volume=buy_volume,
         buy_notional=buy_notional,
@@ -281,8 +352,22 @@ def _print_zero_markets(zero_markets: List[Dict[str, Any]]) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Polymarket 历史仓位统计工具")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
-    parser.add_argument("--fills-limit", type=int, default=500, help="每页拉取的 fills 条数")
-    parser.add_argument("--fills-pages", type=int, default=5, help="fills 最大翻页次数")
+    parser.add_argument(
+        "--trades-limit",
+        "--fills-limit",
+        dest="trades_limit",
+        type=int,
+        default=500,
+        help="每页拉取的 trades 条数（Data-API /trades，默认500）",
+    )
+    parser.add_argument(
+        "--trades-pages",
+        "--fills-pages",
+        dest="trades_pages",
+        type=int,
+        default=5,
+        help="trades 最大翻页次数",
+    )
     parser.add_argument("--history-limit", type=int, default=500, help="历史仓位每页条数")
     parser.add_argument("--history-pages", type=int, default=5, help="历史仓位最大翻页次数")
     args = parser.parse_args(argv)
@@ -303,12 +388,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[INFO] 当前持仓数量：{len(current_positions)}")
 
     try:
-        fills = _fetch_fills(user, limit=max(1, args.fills_limit), max_pages=max(1, args.fills_pages))
+        trades = _fetch_trades(
+            user,
+            limit=max(1, args.trades_limit),
+            max_pages=max(1, args.trades_pages),
+        )
     except Exception as exc:
         print(f"[ERR] 获取历史成交失败：{exc}", file=sys.stderr)
         return 4
 
-    fill_summary = _summarize_fills(fills)
+    trade_summary = _summarize_trades(trades)
 
     try:
         history_entries = _fetch_positions_history(
@@ -326,16 +415,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         output = {
             "wallet": user,
             "current_positions": current_positions,
-            "fills": {
-                "count": fill_summary.fills_count,
-                "buy_count": fill_summary.buy_count,
-                "buy_volume": fill_summary.buy_volume,
-                "buy_notional": fill_summary.buy_notional,
-                "avg_buy_price": fill_summary.avg_buy_price,
-                "sell_count": fill_summary.sell_count,
-                "sell_volume": fill_summary.sell_volume,
-                "sell_notional": fill_summary.sell_notional,
-                "avg_sell_price": fill_summary.avg_sell_price,
+            "trades": {
+                "count": trade_summary.trades_count,
+                "buy_count": trade_summary.buy_count,
+                "buy_volume": trade_summary.buy_volume,
+                "buy_notional": trade_summary.buy_notional,
+                "avg_buy_price": trade_summary.avg_buy_price,
+                "sell_count": trade_summary.sell_count,
+                "sell_volume": trade_summary.sell_volume,
+                "sell_notional": trade_summary.sell_notional,
+                "avg_sell_price": trade_summary.avg_sell_price,
             },
             "history": {
                 "count": history_summary.positions_count,
@@ -350,13 +439,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("\n[TRADES] 历史成交统计：")
     print(
         "  买入次数/数量/金额："
-        f"{fill_summary.buy_count} 笔 | {fill_summary.buy_volume:.4f} | "
-        f"${_fmt_money(fill_summary.buy_notional)} (均价 {_fmt_money(fill_summary.avg_buy_price)})"
+        f"{trade_summary.buy_count} 笔 | {trade_summary.buy_volume:.4f} | "
+        f"${_fmt_money(trade_summary.buy_notional)} (均价 {_fmt_money(trade_summary.avg_buy_price)})"
     )
     print(
         "  卖出数量/金额："
-        f"{fill_summary.sell_count} 笔 | {fill_summary.sell_volume:.4f} | "
-        f"${_fmt_money(fill_summary.sell_notional)} (均价 {_fmt_money(fill_summary.avg_sell_price)})"
+        f"{trade_summary.sell_count} 笔 | {trade_summary.sell_volume:.4f} | "
+        f"${_fmt_money(trade_summary.sell_notional)} (均价 {_fmt_money(trade_summary.avg_sell_price)})"
     )
 
     print("\n[PNL] 历史仓位统计：")
