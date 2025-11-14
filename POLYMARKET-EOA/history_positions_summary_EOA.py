@@ -554,36 +554,50 @@ def _summarize_buy_trades(trades: Iterable[Dict[str, Any]]) -> Dict[str, BuyPosi
 
 def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     resolved: Dict[str, Dict[str, Any]] = {}
+    claim_keys = (
+        "claimAmount",
+        "amountClaimed",
+        "claimedAmount",
+        "payout",
+        "totalPayout",
+        "payoutAmount",
+    )
+    settle_keys = ("settlementPrice", "settledPrice", "resolvePrice")
+
     for entry in entries:
         asset = _extract_asset_id(entry)
         if not asset:
             continue
         ts = _entry_timestamp(entry)
-        claim_value = _first_present(entry, ("claimAmount", "amountClaimed", "claimedAmount"))
-        settlement_value = _first_present(
-            entry,
-            ("settlementPrice", "settledPrice", "resolvePrice"),
-        )
+        claim_value = _first_present(entry, claim_keys)
+        settlement_value = _first_present(entry, settle_keys)
 
         claim_amount = _optional_float(claim_value)
         settlement_price = _optional_float(settlement_value)
         status_text = (entry.get("status") or entry.get("type") or entry.get("action") or "").lower()
+        source_text = str(entry.get("_source") or entry.get("source") or "")
+        is_closed_positions = "closed-positions" in source_text
+
         claimed_flag = bool(
             entry.get("claimed")
             or entry.get("isClaimed")
             or entry.get("wasClaimed")
             or status_text in ("claim", "claimed", "redeem", "redeemed")
+            or (is_closed_positions and (claim_amount is not None and claim_amount >= 0))
         )
         resolved_flag = bool(
             entry.get("resolved")
             or entry.get("isResolved")
             or entry.get("status") == "resolved"
-            or status_text in ("resolve", "resolved", "settled")
+            or status_text in ("resolve", "resolved", "settled", "closed")
+            or is_closed_positions
         )
 
         priority = 0
         if claimed_flag:
             priority = 4
+        elif is_closed_positions and (claim_amount is not None or settlement_price is not None):
+            priority = 3
         elif claim_amount is not None and claim_amount > 0:
             priority = 3
         elif resolved_flag or settlement_price is not None:
@@ -604,7 +618,7 @@ def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str
             "timestamp": ts,
             "was_claimed": claimed_flag,
             "priority": priority,
-            "source": entry.get("_source") or entry.get("source") or "",
+            "source": source_text,
             "raw": entry,
         }
         info["is_resolved"] = resolved_flag or claimed_flag
