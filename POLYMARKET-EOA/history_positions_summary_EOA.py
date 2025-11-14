@@ -7,9 +7,9 @@
 1. 自动识别当前钱包地址（沿用 ``view_positions_EOA`` 的逻辑）。
 2. 拉取 Data-API ``/positions`` 查看当前持仓。
 3. 统计 Data-API ``/trades`` 返回的历史成交（买入数量 / 金额 / 均价等）。
-4. 使用文档支持的 ``/activity`` 端点（兼容旧 ``/positions/history``）汇总
-   历史仓位已实现 PnL，并列出“已 claim 且价格归零”的市场以便复核，
-   避免访问未公开的 API。
+4. 使用文档支持的 ``/activity`` 与 ``/closed-positions`` 端点提取历史
+   仓位结算 / 赔付 / 领取信息，并列出“已 claim 且价格归零”的市场以便
+   复核，避免访问未公开的 API。
 
 使用示例：
     python3 history_positions_summary_EOA.py
@@ -320,37 +320,14 @@ def _fetch_activity(user: str, limit: int, max_pages: int) -> List[Dict[str, Any
     return entries
 
 
-def _positions_history_endpoints() -> List[str]:
-    hosts = [DATA_API_HOST, GAMMA_API_HOST, GAMMA_ALT_HOST]
-    paths = ["/positions/history", "/positions-history"]
-    endpoints: List[str] = []
-    for host in hosts:
-        if not host:
-            continue
-        base = host.rstrip("/")
-        for path in paths:
-            endpoint = f"{base}{path}"
-            if endpoint not in endpoints:
-                endpoints.append(endpoint)
-    return endpoints
+def _fetch_closed_positions(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
+    """从官方文档的 /closed-positions 接口获取历史仓位。"""
 
-
-def _fetch_positions_history(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
-    params = {"user": user, "limit": limit}
-    entries: List[Dict[str, Any]] = []
-    last_error: Optional[Exception] = None
-    for endpoint in _positions_history_endpoints():
-        try:
-            chunk = _paginate(endpoint, params, max_pages)
-        except Exception as exc:  # pragma: no cover - 网络异常
-            last_error = exc
-            continue
-        if chunk:
-            for entry in chunk:
-                entry.setdefault("_source", endpoint)
-            entries.extend(chunk)
-    if not entries and last_error is not None:
-        raise last_error
+    endpoint = f"{DATA_API_HOST}/closed-positions"
+    params = {"user": user}
+    entries = _paginate_offset(endpoint, params, limit, max_pages)
+    for entry in entries:
+        entry.setdefault("_source", endpoint)
     return entries
 
 
@@ -825,14 +802,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         history_entries.extend(
-            _fetch_positions_history(
+            _fetch_closed_positions(
                 user,
                 limit=max(1, args.history_limit),
                 max_pages=max(1, args.history_pages),
             )
         )
     except Exception as exc:
-        print(f"[WARN] 获取 /positions/history 失败：{exc}")
+        print(f"[WARN] 获取 /closed-positions 失败：{exc}")
 
     filtered_trades = _filter_entries_since(trades, since_ts)
     filtered_history = _filter_entries_since(history_entries, since_ts)
