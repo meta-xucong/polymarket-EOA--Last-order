@@ -22,6 +22,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
@@ -56,6 +57,9 @@ except Exception:  # pragma: no cover - 回退到最少依赖
 DATA_API_HOST = os.environ.get("DATA_API_HOST", _VP_DATA_API_HOST).rstrip("/")
 GAMMA_API_HOST = os.environ.get("GAMMA_API_HOST", "https://gamma-api.polymarket.com").rstrip("/")
 GAMMA_ALT_HOST = os.environ.get("GAMMA_ALT_HOST", "https://gamma.polymarket.com").rstrip("/")
+
+DEFAULT_SINCE_DATE = "2025-11-13"
+UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -158,6 +162,88 @@ def _trade_history_endpoints() -> List[str]:
     return endpoints
 
 
+def _normalize_timestamp(value: Any) -> Optional[float]:
+    """尽量把 Data-API 返回的各种时间格式转为 UTC 秒数。"""
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1e12:  # 毫秒时间戳
+            ts /= 1000.0
+        return ts
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        ts = float(text)
+        if ts > 1e12:
+            ts /= 1000.0
+        return ts
+    except Exception:
+        pass
+
+    iso_text = text
+    if iso_text.endswith("Z"):
+        iso_text = iso_text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(iso_text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _entry_timestamp(entry: Dict[str, Any]) -> Optional[float]:
+    timestamp_fields = (
+        "timestamp",
+        "createdAt",
+        "updatedAt",
+        "time",
+        "blockTime",
+        "blockTimestamp",
+        "settledAt",
+        "resolvedAt",
+        "closedAt",
+    )
+    for key in timestamp_fields:
+        if key in entry:
+            ts = _normalize_timestamp(entry.get(key))
+            if ts is not None:
+                return ts
+    return None
+
+
+def _filter_entries_since(entries: Iterable[Dict[str, Any]], since_ts: float) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    for entry in entries:
+        ts = _entry_timestamp(entry)
+        if ts is None or ts >= since_ts:
+            filtered.append(entry)
+    return filtered
+
+
+def _prompt_since_date() -> Tuple[str, float]:
+    prompt = (
+        f"请输入查询起始日期（UTC+8，格式YYYY-MM-DD，默认为 {DEFAULT_SINCE_DATE}）："
+    )
+    try:
+        user_input = input(prompt)
+    except EOFError:
+        user_input = ""
+    date_text = (user_input or "").strip() or DEFAULT_SINCE_DATE
+    try:
+        base_date = datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        print(
+            f"[WARN] 日期格式无效（{date_text}），已使用默认值 {DEFAULT_SINCE_DATE}。"
+        )
+        base_date = datetime.strptime(DEFAULT_SINCE_DATE, "%Y-%m-%d")
+        date_text = DEFAULT_SINCE_DATE
+    aware_dt = base_date.replace(tzinfo=UTC_PLUS_8)
+    since_ts = aware_dt.astimezone(timezone.utc).timestamp()
+    return date_text, since_ts
 def _activity_endpoints() -> List[str]:
     endpoints: List[str] = []
     for host in (DATA_API_HOST, GAMMA_API_HOST, GAMMA_ALT_HOST):
@@ -486,6 +572,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"[INFO] 当前持仓数量：{len(current_positions)}")
 
+    since_date_text, since_ts = _prompt_since_date()
+    print(f"[INFO] 仅统计 {since_date_text} (UTC+8) 当日 00:00 之后的记录。")
+
     try:
         trades = _fetch_trades(
             user,
@@ -496,7 +585,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERR] 获取历史成交失败：{exc}", file=sys.stderr)
         return 4
 
-    trade_summary = _summarize_trades(trades)
+    filtered_trades = _filter_entries_since(trades, since_ts)
+    trade_summary = _summarize_trades(filtered_trades)
 
     try:
         history_entries = _fetch_positions_history(
@@ -508,11 +598,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[WARN] 获取历史仓位失败：{exc}")
         history_entries = []
 
-    history_summary = _summarize_history(history_entries)
+    filtered_history = _filter_entries_since(history_entries, since_ts)
+    history_summary = _summarize_history(filtered_history)
 
     if args.json:
         output = {
             "wallet": user,
+            "since_date_utc8": since_date_text,
             "current_positions": current_positions,
             "trades": {
                 "count": trade_summary.trades_count,
