@@ -848,12 +848,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     print("\n[HISTORY] 历史买入持仓（含结算盈亏）：")
+    total_entries = len(rows)
+    success_count = 0
+    failure_count = 0
+    total_invest = 0.0
+    total_profit = 0.0
+
     for idx, row in enumerate(rows, 1):
         total_size = row.get("totalSize") or 0.0
         avg_price = row.get("avgEntryPrice") or 0.0
         total_cost = row.get("totalCost") or 0.0
+        total_invest += total_cost
         realized_pnl = row.get("realizedPnl")
-        claim_amount = row.get("claimAmount")
         resolution_status = row.get("resolutionStatus")
         if not resolution_status:
             resolution_status = "已结算" if row.get("isResolved") else "未结算"
@@ -863,9 +869,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         resolution_time = _fmt_timestamp_local(row.get("resolutionTime"))
         realized_text = (
             _vp_fmt_money(realized_pnl) if isinstance(realized_pnl, (int, float)) else "-"
-        )
-        claim_text = (
-            _vp_fmt_money(claim_amount) if isinstance(claim_amount, (int, float)) else "-"
         )
         token_label = row.get("tokenOutcomeLabel") or "-"
         token_index = row.get("tokenOutcomeIndex")
@@ -888,20 +891,41 @@ def main(argv: Optional[List[str]] = None) -> int:
             "    "
             f"结算状态={resolution_status} | 结算结果={resolved_outcome} | 已实现盈亏={realized_text} | 结算时间={resolution_time}"
         )
-        print(f"    领取金额/赔付={claim_text}")
         derived_payout = row.get("derivedPayout")
         derived_pnl = row.get("derivedPnl")
         outcome_match = row.get("derivedOutcomeMatch")
+        pnl_for_stats = None
+        if isinstance(realized_pnl, (int, float)):
+            pnl_for_stats = realized_pnl
+        elif isinstance(derived_pnl, (int, float)):
+            pnl_for_stats = derived_pnl
+        if isinstance(pnl_for_stats, (int, float)):
+            total_profit += pnl_for_stats
         if isinstance(derived_pnl, (int, float)) and isinstance(derived_payout, (int, float)):
             payout_text = _vp_fmt_money(derived_payout)
             derived_text = _vp_fmt_money(derived_pnl)
             match_text = "命中" if outcome_match else "失利"
+            if outcome_match is True:
+                success_count += 1
+            elif outcome_match is False:
+                failure_count += 1
             print(
                 "    "
                 f"推导结算：{match_text} | 理论赔付≈{payout_text} | 推导盈亏≈{derived_text}"
             )
         else:
             print("    推导结算：-")
+
+    print("\n[SUMMARY] 统计概览：")
+    roi = (total_profit / total_invest * 100) if total_invest > 0 else 0.0
+    print(
+        f"总条目={total_entries} | 命中={success_count} | 失利={failure_count}"
+    )
+    print(
+        "总投入≈{} | 总收益≈{} | 总收益率≈{:.2f}%".format(
+            _vp_fmt_money(total_invest), _vp_fmt_money(total_profit), roi
+        )
+    )
 
     return 0
 
