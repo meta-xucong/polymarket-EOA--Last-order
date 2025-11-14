@@ -892,10 +892,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         derived_pnl = row.get("derivedPnl")
         outcome_match = row.get("derivedOutcomeMatch")
         pnl_for_stats = None
-        if isinstance(realized_pnl, (int, float)):
-            pnl_for_stats = realized_pnl
-        elif isinstance(derived_pnl, (int, float)):
+        # 统计概览希望与“推导结算”保持一致，因此优先使用推导盈亏；
+        # 若缺少推导数据，再退回到 API 提供的 realized pnl。
+        if isinstance(derived_pnl, (int, float)):
             pnl_for_stats = derived_pnl
+        elif isinstance(realized_pnl, (int, float)):
+            pnl_for_stats = realized_pnl
         if isinstance(pnl_for_stats, (int, float)):
             total_profit += pnl_for_stats
         if isinstance(derived_pnl, (int, float)) and isinstance(derived_payout, (int, float)):
