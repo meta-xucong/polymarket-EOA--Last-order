@@ -215,6 +215,16 @@ def _entry_timestamp(entry: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _fmt_timestamp_local(ts: Optional[float]) -> str:
+    if ts is None:
+        return "-"
+    try:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(UTC_PLUS_8)
+    except Exception:
+        return "-"
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
 def _filter_entries_since(entries: Iterable[Dict[str, Any]], since_ts: float) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
     for entry in entries:
@@ -382,12 +392,43 @@ class HistorySummary:
     realized_cash_pnl: float
     avg_percent_pnl: Optional[float]
     zero_markets: List[Dict[str, Any]]
+    entries: List[Dict[str, Any]]
+
+
+def _extract_first_float(entry: Dict[str, Any], fields: Tuple[str, ...]) -> Optional[float]:
+    for key in fields:
+        if key not in entry:
+            continue
+        value = entry.get(key)
+        if value in (None, ""):
+            continue
+        return _safe_float(value)
+    return None
+
+
+def _extract_side(entry: Dict[str, Any]) -> Optional[str]:
+    for key in (
+        "side",
+        "direction",
+        "action",
+        "activityType",
+        "type",
+        "status",
+    ):
+        raw = entry.get(key)
+        if raw in (None, ""):
+            continue
+        text = str(raw).strip().lower()
+        if text in {"buy", "sell"}:
+            return text
+    return None
 
 
 def _summarize_history(entries: Iterable[Dict[str, Any]]) -> HistorySummary:
     realized = 0.0
     pct_values: List[float] = []
     zero_markets: List[Dict[str, Any]] = []
+    details: List[Dict[str, Any]] = []
     count = 0
     for entry in entries:
         status_text = str(
@@ -424,7 +465,7 @@ def _summarize_history(entries: Iterable[Dict[str, Any]]) -> HistorySummary:
             continue
 
         count += 1
-        realized += _safe_float(
+        realized_component = _safe_float(
             entry.get("cashPnl")
             or entry.get("realizedPnl")
             or entry.get("payout")
@@ -432,6 +473,7 @@ def _summarize_history(entries: Iterable[Dict[str, Any]]) -> HistorySummary:
             or entry.get("amount")
             or entry.get("value")
         )
+        realized += realized_component
         percent = (
             entry.get("percentPnl")
             or entry.get("percent_pnl")
@@ -442,51 +484,71 @@ def _summarize_history(entries: Iterable[Dict[str, Any]]) -> HistorySummary:
         if has_pct:
             pct_values.append(pct_val)
 
-        price_fields = (
-            "curPrice",
-            "markPrice",
-            "avgPrice",
-            "finalPrice",
-            "price",
-            "payoutPerToken",
-            "tokenPayout",
-            "perSharePayout",
+        buy_price = _extract_first_float(
+            entry,
+            (
+                "avgPrice",
+                "averagePrice",
+                "entryPrice",
+                "buyPrice",
+                "price",
+                "fillPrice",
+                "executionPrice",
+                "tradePrice",
+            ),
         )
-        cur_price = None
-        for key in price_fields:
-            cur_price = entry.get(key)
-            if cur_price not in (None, ""):
-                cur_price = _safe_float(cur_price)
-                break
-        if cur_price in (None, ""):
-            cur_price = None
-
+        settlement_price = _extract_first_float(
+            entry,
+            (
+                "settlementPrice",
+                "resolvedPrice",
+                "payoutPerToken",
+                "tokenPayout",
+                "perSharePayout",
+                "finalPrice",
+                "curPrice",
+                "markPrice",
+            ),
+        )
         size_now = entry.get("size") or entry.get("quantity") or entry.get("tokens")
         size_now_val = None
         if size_now not in (None, ""):
             size_now_val = _safe_float(size_now)
 
         zero_reason = None
-        if cur_price is not None and cur_price <= 0.0001:
+        if settlement_price is not None and settlement_price <= 0.0001:
             zero_reason = "price"
         elif size_now_val is not None and size_now_val <= 0:
             zero_reason = "size"
 
+        side = _extract_side(entry)
+        ts = _entry_timestamp(entry)
+        detail = {
+            "title": entry.get("title")
+            or entry.get("market")
+            or entry.get("question")
+            or entry.get("slug"),
+            "outcome": entry.get("outcome"),
+            "side": side,
+            "buy_price": buy_price,
+            "settlement_price": settlement_price,
+            "realized_cash_pnl": realized_component,
+            "percent_pnl": pct_val if has_pct else None,
+            "size": size_now_val,
+            "timestamp": ts,
+            "timestamp_local": _fmt_timestamp_local(ts),
+            "claim_tx": entry.get("claimTx") or entry.get("transactionHash"),
+        }
+        details.append(detail)
+
         if zero_reason:
             zero_markets.append(
                 {
-                    "title": entry.get("title")
-                    or entry.get("market")
-                    or entry.get("question")
-                    or entry.get("slug"),
-                    "outcome": entry.get("outcome"),
-                    "cashPnl": _safe_float(
-                        entry.get("cashPnl")
-                        or entry.get("realizedPnl")
-                        or entry.get("payout")
-                    ),
-                    "percentPnl": pct_val if has_pct else None,
-                    "claimTx": entry.get("claimTx") or entry.get("transactionHash"),
+                    "title": detail["title"],
+                    "outcome": detail["outcome"],
+                    "cashPnl": detail["realized_cash_pnl"],
+                    "percentPnl": detail["percent_pnl"],
+                    "claimTx": detail["claim_tx"],
                 }
             )
 
@@ -499,11 +561,18 @@ def _summarize_history(entries: Iterable[Dict[str, Any]]) -> HistorySummary:
         realized_cash_pnl=realized,
         avg_percent_pnl=avg_percent,
         zero_markets=zero_markets,
+        entries=details,
     )
 
 
 def _fmt_money(value: float) -> str:
     return _vp_fmt_money(value)
+
+
+def _fmt_price(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.4f}"
 
 
 def _print_zero_markets(zero_markets: List[Dict[str, Any]]) -> None:
@@ -622,6 +691,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "realized_cash_pnl": history_summary.realized_cash_pnl,
                 "avg_percent_pnl": history_summary.avg_percent_pnl,
                 "zero_markets": history_summary.zero_markets,
+                "entries": history_summary.entries,
             },
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
@@ -646,6 +716,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if history_summary.avg_percent_pnl is not None:
         print(f"  平均百分比收益：{history_summary.avg_percent_pnl:+.2f}%")
+    if history_summary.entries:
+        print("\n[HISTORY DETAILS] 历史仓位条目：")
+        for idx, detail in enumerate(history_summary.entries, 1):
+            title = detail.get("title") or "(未知市场)"
+            outcome = detail.get("outcome") or "?"
+            ts_txt = detail.get("timestamp_local") or _fmt_timestamp_local(
+                detail.get("timestamp")
+            )
+            side = detail.get("side")
+            side_txt = side.upper() if isinstance(side, str) and side else "-"
+            buy_txt = _fmt_price(detail.get("buy_price"))
+            settle_txt = _fmt_price(detail.get("settlement_price"))
+            pnl_txt = _fmt_money(_safe_float(detail.get("realized_cash_pnl")))
+            print(
+                "  "
+                + f"{idx:02d}. [{ts_txt}] {title} ({outcome}) | 方向: {side_txt}"
+                + f" | 买入价: {buy_txt} | 结算价: {settle_txt} | 已实现P/L: ${pnl_txt}"
+            )
     _print_zero_markets(history_summary.zero_markets)
 
     return 0
