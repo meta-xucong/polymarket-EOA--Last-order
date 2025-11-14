@@ -744,6 +744,16 @@ def _compose_position_rows(
         row["derivedPayout"] = payout
         row["derivedPnl"] = derived_pnl
         row["derivedOutcomeMatch"] = outcome_match
+        realized_pnl = row.get("realizedPnl")
+        has_reliable_derivation = isinstance(derived_pnl, (int, float)) and (
+            isinstance(payout, (int, float)) or outcome_match is not None
+        )
+        if has_reliable_derivation:
+            if not isinstance(realized_pnl, (int, float)):
+                row["realizedPnl"] = derived_pnl
+            else:
+                if abs(realized_pnl - derived_pnl) > 1e-6:
+                    row["realizedPnl"] = derived_pnl
     rows.sort(key=lambda r: (r.get("lastBuyTime") or 0), reverse=True)
     return rows
 
@@ -891,13 +901,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         derived_payout = row.get("derivedPayout")
         derived_pnl = row.get("derivedPnl")
         outcome_match = row.get("derivedOutcomeMatch")
-        pnl_for_stats = None
         if isinstance(realized_pnl, (int, float)):
-            pnl_for_stats = realized_pnl
-        elif isinstance(derived_pnl, (int, float)):
-            pnl_for_stats = derived_pnl
-        if isinstance(pnl_for_stats, (int, float)):
-            total_profit += pnl_for_stats
+            total_profit += realized_pnl
         if isinstance(derived_pnl, (int, float)) and isinstance(derived_payout, (int, float)):
             payout_text = _vp_fmt_money(derived_payout)
             derived_text = _vp_fmt_money(derived_pnl)
