@@ -314,7 +314,44 @@ def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]
 def _fetch_activity(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
     endpoint = f"{DATA_API_HOST}/activity"
     params = {"user": user, "limit": limit}
-    return _paginate(endpoint, params, max_pages)
+    entries = _paginate(endpoint, params, max_pages)
+    for entry in entries:
+        entry.setdefault("_source", endpoint)
+    return entries
+
+
+def _positions_history_endpoints() -> List[str]:
+    hosts = [DATA_API_HOST, GAMMA_API_HOST, GAMMA_ALT_HOST]
+    paths = ["/positions/history", "/positions-history"]
+    endpoints: List[str] = []
+    for host in hosts:
+        if not host:
+            continue
+        base = host.rstrip("/")
+        for path in paths:
+            endpoint = f"{base}{path}"
+            if endpoint not in endpoints:
+                endpoints.append(endpoint)
+    return endpoints
+
+
+def _fetch_positions_history(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
+    params = {"user": user, "limit": limit}
+    entries: List[Dict[str, Any]] = []
+    last_error: Optional[Exception] = None
+    for endpoint in _positions_history_endpoints():
+        try:
+            chunk = _paginate(endpoint, params, max_pages)
+        except Exception as exc:  # pragma: no cover - 网络异常
+            last_error = exc
+            continue
+        if chunk:
+            for entry in chunk:
+                entry.setdefault("_source", endpoint)
+            entries.extend(chunk)
+    if not entries and last_error is not None:
+        raise last_error
+    return entries
 
 
 def _paginate(endpoint: str, params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
@@ -551,6 +588,32 @@ def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str
             ("settlementPrice", "settledPrice", "resolvePrice"),
         )
 
+        claim_amount = _optional_float(claim_value)
+        settlement_price = _optional_float(settlement_value)
+        status_text = (entry.get("status") or entry.get("type") or entry.get("action") or "").lower()
+        claimed_flag = bool(
+            entry.get("claimed")
+            or entry.get("isClaimed")
+            or entry.get("wasClaimed")
+            or status_text in ("claim", "claimed", "redeem", "redeemed")
+        )
+        resolved_flag = bool(
+            entry.get("resolved")
+            or entry.get("isResolved")
+            or entry.get("status") == "resolved"
+            or status_text in ("resolve", "resolved", "settled")
+        )
+
+        priority = 0
+        if claimed_flag:
+            priority = 4
+        elif claim_amount is not None and claim_amount > 0:
+            priority = 3
+        elif resolved_flag or settlement_price is not None:
+            priority = 2
+        else:
+            priority = 1
+
         info = {
             "asset": asset,
             "status": entry.get("status") or entry.get("type") or entry.get("action") or "",
@@ -559,27 +622,28 @@ def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str
             or entry.get("outcome")
             or entry.get("result"),
             "cash_pnl": _extract_cash_pnl(entry),
-            "claim_amount": _optional_float(claim_value),
-            "settlement_price": _optional_float(settlement_value),
+            "claim_amount": claim_amount,
+            "settlement_price": settlement_price,
             "timestamp": ts,
-            "was_claimed": bool(
-                entry.get("claimed")
-                or entry.get("isClaimed")
-                or entry.get("wasClaimed")
-                or (entry.get("type") or "").lower() == "claim"
-                or (entry.get("action") or "").lower() == "claim"
-            ),
+            "was_claimed": claimed_flag,
+            "priority": priority,
+            "source": entry.get("_source") or entry.get("source") or "",
             "raw": entry,
         }
-        info["is_resolved"] = bool(
-            entry.get("resolved")
-            or entry.get("isResolved")
-            or entry.get("status") == "resolved"
-            or (entry.get("type") or "").lower() in ("claim", "resolve")
-        )
+        info["is_resolved"] = resolved_flag or claimed_flag
         prev = resolved.get(asset)
         prev_ts = prev.get("timestamp") if prev else None
-        if prev is None or (ts is not None and (prev_ts is None or ts >= prev_ts)):
+        prev_priority = prev.get("priority") if prev else None
+        should_replace = False
+        if prev is None:
+            should_replace = True
+        else:
+            if prev_priority is None or priority > prev_priority:
+                should_replace = True
+            elif priority == prev_priority:
+                if ts is not None and (prev_ts is None or ts >= prev_ts):
+                    should_replace = True
+        if should_replace:
             resolved[asset] = info
     return resolved
 
@@ -747,15 +811,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERR] 获取历史成交失败：{exc}", file=sys.stderr)
         return 4
 
+    history_entries: List[Dict[str, Any]] = []
     try:
-        history_entries = _fetch_activity(
-            user,
-            limit=max(1, args.history_limit),
-            max_pages=max(1, args.history_pages),
+        history_entries.extend(
+            _fetch_activity(
+                user,
+                limit=max(1, args.history_limit),
+                max_pages=max(1, args.history_pages),
+            )
         )
     except Exception as exc:
         print(f"[WARN] 获取历史仓位 /activity 失败：{exc}")
-        history_entries = []
+
+    try:
+        history_entries.extend(
+            _fetch_positions_history(
+                user,
+                limit=max(1, args.history_limit),
+                max_pages=max(1, args.history_pages),
+            )
+        )
+    except Exception as exc:
+        print(f"[WARN] 获取 /positions/history 失败：{exc}")
 
     filtered_trades = _filter_entries_since(trades, since_ts)
     filtered_history = _filter_entries_since(history_entries, since_ts)
