@@ -867,9 +867,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         first_ts = _fmt_timestamp_local(row.get("firstBuyTime"))
         last_ts = _fmt_timestamp_local(row.get("lastBuyTime"))
         resolution_time = _fmt_timestamp_local(row.get("resolutionTime"))
-        realized_text = (
-            _vp_fmt_money(realized_pnl) if isinstance(realized_pnl, (int, float)) else "-"
-        )
         token_label = row.get("tokenOutcomeLabel") or "-"
         token_index = row.get("tokenOutcomeIndex")
         token_side = row.get("tokenOutcomeSide") or ""
@@ -889,7 +886,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"    买入时间区间：{first_ts} -> {last_ts}")
         print(
             "    "
-            f"结算状态={resolution_status} | 结算结果={resolved_outcome} | 已实现盈亏={realized_text} | 结算时间={resolution_time}"
+            f"结算状态={resolution_status} | 结算结果={resolved_outcome} | 结算时间={resolution_time}"
         )
         derived_payout = row.get("derivedPayout")
         derived_pnl = row.get("derivedPnl")
@@ -915,6 +912,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         else:
             print("    推导结算：-")
+
+        print()
 
     print("\n[SUMMARY] 统计概览：")
     roi = (total_profit / total_invest * 100) if total_invest > 0 else 0.0
