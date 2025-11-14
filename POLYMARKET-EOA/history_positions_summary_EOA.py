@@ -78,6 +78,29 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    """在可选字段上使用的浮点解析，不会把缺失值当成 0。"""
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _first_present(entry: Dict[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        if key in entry:
+            return entry.get(key)
+    return None
+
+
 def _extract_items(payload: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """容错解析 Data-API 返回的 list + cursor。"""
 
@@ -522,6 +545,12 @@ def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str
         if not asset:
             continue
         ts = _entry_timestamp(entry)
+        claim_value = _first_present(entry, ("claimAmount", "amountClaimed", "claimedAmount"))
+        settlement_value = _first_present(
+            entry,
+            ("settlementPrice", "settledPrice", "resolvePrice"),
+        )
+
         info = {
             "asset": asset,
             "status": entry.get("status") or entry.get("type") or entry.get("action") or "",
@@ -530,16 +559,8 @@ def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str
             or entry.get("outcome")
             or entry.get("result"),
             "cash_pnl": _extract_cash_pnl(entry),
-            "claim_amount": _safe_float(
-                entry.get("claimAmount")
-                or entry.get("amountClaimed")
-                or entry.get("claimedAmount")
-            ),
-            "settlement_price": _safe_float(
-                entry.get("settlementPrice")
-                or entry.get("settledPrice")
-                or entry.get("resolvePrice")
-            ),
+            "claim_amount": _optional_float(claim_value),
+            "settlement_price": _optional_float(settlement_value),
             "timestamp": ts,
             "was_claimed": bool(
                 entry.get("claimed")
