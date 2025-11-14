@@ -79,17 +79,30 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _extract_items(payload: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """容错解析 Data-API 返回的 list + cursor。"""
-    print(f"[DEBUG] API 返回数据：{payload}")  # 打印返回的原始数据
+
+    cursor: Optional[str] = None
+
+    def _extract_cursor(raw: Dict[str, Any]) -> Optional[str]:
+        for key in ("next", "nextCursor", "next_page", "nextPage", "cursor"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
     if isinstance(payload, list):
         return [it for it in payload if isinstance(it, dict)], None
+
     if isinstance(payload, dict):
         for key in ("data", "results", "items", "fills", "positions", "history"):
             arr = payload.get(key)
             if isinstance(arr, list):
+                cursor = _extract_cursor(payload)
                 break
         else:
             arr = []
-        return [it for it in arr if isinstance(it, dict)], None
+            cursor = _extract_cursor(payload)
+        return [it for it in arr if isinstance(it, dict)], cursor
+
     return [], None
 
 
@@ -99,6 +112,12 @@ def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]
     trades_endpoint = f"{DATA_API_HOST}/trades"
     params = {"user": user, "limit": limit}
     return _paginate(trades_endpoint, params, max_pages)
+
+
+def _fetch_activity(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
+    endpoint = f"{DATA_API_HOST}/activity"
+    params = {"user": user, "limit": limit}
+    return _paginate(endpoint, params, max_pages)
 
 
 def _paginate(endpoint: str, params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
@@ -216,6 +235,160 @@ def _entry_timestamp(entry: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _extract_asset_id(entry: Dict[str, Any]) -> str:
+    for key in ("asset", "tokenId", "token_id", "tokenID", "id"):
+        value = entry.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    token = entry.get("token")
+    if isinstance(token, dict):
+        for key in ("tokenId", "id", "asset"):
+            value = token.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _extract_cash_pnl(entry: Dict[str, Any]) -> Optional[float]:
+    for key in (
+        "cashPnl",
+        "cashPnlTotal",
+        "realizedPnl",
+        "realizedPnL",
+        "pnl",
+        "PnL",
+        "profit",
+        "payout",
+    ):
+        if key in entry:
+            val = _safe_float(entry.get(key))
+            return val
+    return None
+
+
+@dataclass
+class BuyPosition:
+    asset: str
+    title: str = ""
+    outcome: str = ""
+    market_slug: str = ""
+    condition_id: str = ""
+    icon: str = ""
+    total_size: float = 0.0
+    total_cost: float = 0.0
+    first_ts: Optional[float] = None
+    last_ts: Optional[float] = None
+
+    def register_trade(self, trade: Dict[str, Any], size: float, price: float, ts: Optional[float]) -> None:
+        if size <= 0:
+            return
+        self.total_size += size
+        self.total_cost += size * price
+        if not self.title:
+            self.title = (
+                trade.get("title")
+                or trade.get("market")
+                or trade.get("eventSlug")
+                or trade.get("slug")
+                or ""
+            )
+        if not self.outcome:
+            self.outcome = trade.get("outcome") or trade.get("outcomeName") or ""
+        if not self.market_slug:
+            self.market_slug = trade.get("slug") or trade.get("marketSlug") or trade.get("eventSlug") or ""
+        if not self.condition_id:
+            self.condition_id = trade.get("conditionId") or trade.get("condition_id") or ""
+        if not self.icon:
+            self.icon = trade.get("icon") or ""
+        if ts is not None:
+            if self.first_ts is None or ts < self.first_ts:
+                self.first_ts = ts
+            if self.last_ts is None or ts > self.last_ts:
+                self.last_ts = ts
+
+    @property
+    def avg_price(self) -> float:
+        if self.total_size <= 0:
+            return 0.0
+        return self.total_cost / self.total_size
+
+
+def _summarize_buy_trades(trades: Iterable[Dict[str, Any]]) -> Dict[str, BuyPosition]:
+    summary: Dict[str, BuyPosition] = {}
+    for trade in trades:
+        side = (trade.get("side") or "").upper()
+        if side != "BUY":
+            continue
+        asset = _extract_asset_id(trade)
+        if not asset:
+            continue
+        size = _safe_float(trade.get("size"))
+        price = _safe_float(trade.get("price"))
+        if size <= 0:
+            continue
+        ts = _entry_timestamp(trade)
+        bucket = summary.get(asset)
+        if bucket is None:
+            bucket = BuyPosition(asset=asset)
+            summary[asset] = bucket
+        bucket.register_trade(trade, size, price, ts)
+    return summary
+
+
+def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for entry in entries:
+        asset = _extract_asset_id(entry)
+        if not asset:
+            continue
+        ts = _entry_timestamp(entry)
+        info = {
+            "asset": asset,
+            "status": entry.get("status") or entry.get("type") or entry.get("action") or "",
+            "resolved_outcome": entry.get("winningOutcome")
+            or entry.get("resolvedOutcome")
+            or entry.get("outcome")
+            or entry.get("result"),
+            "cash_pnl": _extract_cash_pnl(entry),
+            "claim_amount": _safe_float(
+                entry.get("claimAmount")
+                or entry.get("amountClaimed")
+                or entry.get("claimedAmount")
+            ),
+            "settlement_price": _safe_float(
+                entry.get("settlementPrice")
+                or entry.get("settledPrice")
+                or entry.get("resolvePrice")
+            ),
+            "timestamp": ts,
+            "was_claimed": bool(
+                entry.get("claimed")
+                or entry.get("isClaimed")
+                or entry.get("wasClaimed")
+                or (entry.get("type") or "").lower() == "claim"
+                or (entry.get("action") or "").lower() == "claim"
+            ),
+            "raw": entry,
+        }
+        info["is_resolved"] = bool(
+            entry.get("resolved")
+            or entry.get("isResolved")
+            or entry.get("status") == "resolved"
+            or (entry.get("type") or "").lower() in ("claim", "resolve")
+        )
+        prev = resolved.get(asset)
+        prev_ts = prev.get("timestamp") if prev else None
+        if prev is None or (ts is not None and (prev_ts is None or ts >= prev_ts)):
+            resolved[asset] = info
+    return resolved
+
+
 def _fmt_timestamp_local(ts: Optional[float]) -> str:
     if ts is None:
         return "-"
@@ -241,10 +414,50 @@ def _prompt_since_date() -> Tuple[str, float]:
     )
     user_input = input(prompt)
     date_text = (user_input or "").strip() or DEFAULT_SINCE_DATE
-    base_date = datetime.strptime(date_text, "%Y-%m-%d")
+    try:
+        base_date = datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        print(f"[WARN] 无法解析日期 '{date_text}'，回退到默认 {DEFAULT_SINCE_DATE}。")
+        date_text = DEFAULT_SINCE_DATE
+        base_date = datetime.strptime(date_text, "%Y-%m-%d")
     aware_dt = base_date.replace(tzinfo=UTC_PLUS_8)
     since_ts = aware_dt.astimezone(timezone.utc).timestamp()  # 强制转换为秒（UTC）
     return date_text, since_ts
+
+
+def _compose_position_rows(
+    positions: Dict[str, BuyPosition],
+    realized: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for asset, bucket in positions.items():
+        realized_entry = realized.get(asset)
+        resolved_ts = realized_entry.get("timestamp") if realized_entry else None
+        rows.append(
+            {
+                "asset": asset,
+                "title": bucket.title,
+                "outcome": bucket.outcome,
+                "marketSlug": bucket.market_slug,
+                "conditionId": bucket.condition_id,
+                "icon": bucket.icon,
+                "totalSize": bucket.total_size,
+                "avgEntryPrice": bucket.avg_price,
+                "totalCost": bucket.total_cost,
+                "firstBuyTime": bucket.first_ts,
+                "lastBuyTime": bucket.last_ts,
+                "resolutionTime": resolved_ts,
+                "resolutionStatus": realized_entry.get("status") if realized_entry else None,
+                "resolvedOutcome": realized_entry.get("resolved_outcome") if realized_entry else None,
+                "realizedPnl": realized_entry.get("cash_pnl") if realized_entry else None,
+                "claimAmount": realized_entry.get("claim_amount") if realized_entry else None,
+                "settlementPrice": realized_entry.get("settlement_price") if realized_entry else None,
+                "isResolved": realized_entry.get("is_resolved") if realized_entry else False,
+                "wasClaimed": realized_entry.get("was_claimed") if realized_entry else False,
+            }
+        )
+    rows.sort(key=lambda r: (r.get("lastBuyTime") or 0), reverse=True)
+    return rows
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -301,26 +514,70 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERR] 获取历史成交失败：{exc}", file=sys.stderr)
         return 4
 
-    # Filter trades since the specified date
+    try:
+        history_entries = _fetch_activity(
+            user,
+            limit=max(1, args.history_limit),
+            max_pages=max(1, args.history_pages),
+        )
+    except Exception as exc:
+        print(f"[WARN] 获取历史仓位 /activity 失败：{exc}")
+        history_entries = []
+
     filtered_trades = _filter_entries_since(trades, since_ts)
+    filtered_history = _filter_entries_since(history_entries, since_ts)
+
+    buy_positions = _summarize_buy_trades(filtered_trades)
+    realized_map = _summarize_activity(filtered_history)
+    rows = _compose_position_rows(buy_positions, realized_map)
 
     if args.json:
-        # Output the filtered trades in JSON format
         output = {
             "wallet": user,
             "since_date_utc8": since_date_text,
+            "positions": rows,
             "trades": filtered_trades,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
 
-    # Output formatted trade summary
-    print("[TRADES] 历史成交统计：")
-    for trade in filtered_trades:
-        print(
-            f"交易方向: {trade['side']} | 资产: {trade['asset']} | "
-            f"买入价格: {trade['price']} | 时间戳: {trade['timestamp']} | 市场结算结果: {trade['outcome']}"
+    if not rows:
+        print("[INFO] 在指定区间内没有买入记录。")
+        return 0
+
+    print("\n[HISTORY] 历史买入持仓（含结算盈亏）：")
+    for idx, row in enumerate(rows, 1):
+        total_size = row.get("totalSize") or 0.0
+        avg_price = row.get("avgEntryPrice") or 0.0
+        total_cost = row.get("totalCost") or 0.0
+        realized_pnl = row.get("realizedPnl")
+        claim_amount = row.get("claimAmount")
+        resolution_status = row.get("resolutionStatus")
+        if not resolution_status:
+            resolution_status = "已结算" if row.get("isResolved") else "未结算"
+        resolved_outcome = row.get("resolvedOutcome") or "-"
+        first_ts = _fmt_timestamp_local(row.get("firstBuyTime"))
+        last_ts = _fmt_timestamp_local(row.get("lastBuyTime"))
+        resolution_time = _fmt_timestamp_local(row.get("resolutionTime"))
+        realized_text = (
+            _vp_fmt_money(realized_pnl) if isinstance(realized_pnl, (int, float)) else "-"
         )
+        claim_text = (
+            _vp_fmt_money(claim_amount) if isinstance(claim_amount, (int, float)) else "-"
+        )
+        print(
+            f"{idx:>2}. {row.get('title') or '-'} | {row.get('outcome') or '-'} | token_id={row.get('asset')}"
+        )
+        print(
+            "    "
+            f"买入方向=BUY | 买入总量={total_size:.4f} | 均价={_vp_fmt_money(avg_price)} | 总成本≈{_vp_fmt_money(total_cost)}"
+        )
+        print(f"    买入时间区间：{first_ts} -> {last_ts}")
+        print(
+            "    "
+            f"结算状态={resolution_status} | 结算结果={resolved_outcome} | 已实现盈亏={realized_text} | 结算时间={resolution_time}"
+        )
+        print(f"    领取金额/赔付={claim_text}")
 
     return 0
 
