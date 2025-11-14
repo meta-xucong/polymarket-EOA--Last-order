@@ -50,6 +50,19 @@ WCOL_ABI = ERC20_ABI + [
      "inputs":[{"name":"_to","type":"address"},{"name":"_amount","type":"uint256"}],"outputs":[]},
 ]
 
+
+def _looks_like_panic_overflow(exc: Exception) -> bool:
+    """
+    兜底识别 Solidity Panic(0x11)：“算术运算溢出/下溢”。
+    web3 抛出的异常结构不固定，这里只要匹配 revert data 0x4e487b71...0011 即视为命中。
+    """
+
+    text = repr(exc)
+    if not text:
+        return False
+    text = text.lower()
+    return "0x4e487b71" in text and "0011" in text
+
 # ---------- 小工具 ----------
 def _b32(x: str) -> str:
     x = str(x)
@@ -231,6 +244,7 @@ def main(argv: List[str]) -> int:
     gas_price = int(w3.eth.gas_price * max(float(args.gas_mult), 0.1))
 
     # 若有可兑付，先执行 claim；否则仅提示但不退出，让后续 unwrap 生效
+    claim_failures = 0
     if groups:
         print(f"[INFO] 即将处理 {len(groups)} 笔市场 Claim。")
         sent = 0
@@ -271,21 +285,35 @@ def main(argv: List[str]) -> int:
                 continue
 
             # 上链
-            tx = call.build_transaction({"from": owner, "nonce": nonce, "gasPrice": gas_price})
             try:
-                est = w3.eth.estimate_gas(tx)
-                tx["gas"] = int(est * 1.2)
-            except Exception:
-                tx["gas"] = 200000
-            signed = w3.eth.account.sign_transaction(tx, private_key=priv)
-            txh = w3.eth.send_raw_transaction(signed.rawTransaction)
-            rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=120)
-            print(f"[INFO] 交易成功 {txh.hex()} | gasUsed={rcpt.gasUsed}")
-            nonce += 1
-            sent += 1
+                tx = call.build_transaction({"from": owner, "nonce": nonce, "gasPrice": gas_price})
+                try:
+                    est = w3.eth.estimate_gas(tx)
+                    tx["gas"] = int(est * 1.2)
+                except Exception:
+                    tx["gas"] = 200000
+                signed = w3.eth.account.sign_transaction(tx, private_key=priv)
+                txh = w3.eth.send_raw_transaction(signed.rawTransaction)
+                rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=120)
+                print(f"[INFO] 交易成功 {txh.hex()} | gasUsed={rcpt.gasUsed}")
+                nonce += 1
+                sent += 1
+            except Exception as exc:
+                claim_failures += 1
+                if _looks_like_panic_overflow(exc):
+                    print(
+                        f"[WARN] redeemPositions 被链上拒绝（Panic 0x11，可能已兑付完毕）：{exc}."
+                        " 继续处理下一笔。"
+                    )
+                else:
+                    print(f"[WARN] redeemPositions 交易失败：{exc}。继续处理下一笔。")
+                # nonce 只有在交易成功广播并返回 receipt 时才增加
+                continue
 
         print("-"*72)
         print(f"[DONE] Claim 流程结束，发送交易 {sent} 笔。")
+        if claim_failures:
+            print(f"[WARN] 其中 {claim_failures} 笔在链上被拒绝或已无可兑付余额，请核查上方日志。")
     else:
         print("[INFO] 没有可兑付的市场（Data-API / 本地输入为空）。继续尝试自动 unwrap WCOL。")
 
