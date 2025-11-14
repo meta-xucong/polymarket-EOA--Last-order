@@ -6,8 +6,9 @@
 1. 自动识别当前钱包地址（沿用 ``view_positions_EOA.py`` 的逻辑）。
 2. 拉取 Data-API ``/positions`` 查看当前持仓。
 3. 统计 Data-API ``/trades`` 返回的历史成交（买入数量 / 金额 / 均价等）。
-4. 汇总 ``/positions/history``（或 ``/positions-history``）返回的历史仓位已实现 PnL，
-   并列出“已 claim 且价格归零”的市场以便复核。
+4. 使用文档支持的 ``/activity`` 端点（兼容旧 ``/positions/history``）汇总
+   历史仓位已实现 PnL，并列出“已 claim 且价格归零”的市场以便复核，
+   避免访问未公开的 API。
 
 使用示例：
     python3 history_positions_summary_EOA.py
@@ -157,6 +158,18 @@ def _trade_history_endpoints() -> List[str]:
     return endpoints
 
 
+def _activity_endpoints() -> List[str]:
+    endpoints: List[str] = []
+    for host in (DATA_API_HOST, GAMMA_API_HOST, GAMMA_ALT_HOST):
+        if not host:
+            continue
+        base = host.rstrip("/")
+        endpoint = f"{base}/activity"
+        if endpoint not in endpoints:
+            endpoints.append(endpoint)
+    return endpoints
+
+
 def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
     capped_limit = max(1, min(limit, 10000))
     trade_params = {"user": user, "takerOnly": False}
@@ -188,15 +201,30 @@ def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]
 
 
 def _fetch_positions_history(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
-    params = {"user": user, "limit": limit}
-    endpoints = [
-        f"{DATA_API_HOST}/positions/history",
-        f"{DATA_API_HOST}/positions-history",
-    ]
+    capped_limit = max(1, min(limit, 1000))
+    params = {"user": user}
+    alias_params = {
+        "user": user,
+        "wallet": user,
+        "walletAddress": user,
+        "address": user,
+        "limit": capped_limit,
+    }
+    endpoints: List[Tuple[str, bool]] = []
+    for endpoint in _activity_endpoints():
+        endpoints.append((endpoint, True))
+    for host in (DATA_API_HOST, GAMMA_API_HOST, GAMMA_ALT_HOST):
+        if not host:
+            continue
+        base = host.rstrip("/")
+        endpoints.append((f"{base}/positions/history", False))
+        endpoints.append((f"{base}/positions-history", False))
     last_error: Optional[Exception] = None
-    for url in endpoints:
+    for url, is_activity in endpoints:
         try:
-            return _paginate(url, params, max_pages)
+            if is_activity:
+                return _paginate_offset(url, params, capped_limit, max_pages)
+            return _paginate(url, alias_params, max_pages)
         except requests.HTTPError as exc:  # pragma: no cover - 仅在 API 不支持时出现
             last_error = exc
             if exc.response.status_code in {404, 405}:
@@ -276,8 +304,48 @@ def _summarize_history(entries: Iterable[Dict[str, Any]]) -> HistorySummary:
     zero_markets: List[Dict[str, Any]] = []
     count = 0
     for entry in entries:
+        status_text = str(
+            entry.get("status")
+            or entry.get("state")
+            or entry.get("type")
+            or entry.get("activityType")
+            or entry.get("action")
+            or ""
+        ).lower()
+        has_history_fields = any(
+            key in entry
+            for key in (
+                "cashPnl",
+                "realizedPnl",
+                "percentPnl",
+                "percentReturn",
+                "payout",
+                "payoutAmount",
+                "claimTx",
+            )
+        )
+        claim_like = status_text in {
+            "claim",
+            "claimed",
+            "redeem",
+            "redeemed",
+            "resolution",
+            "resolved",
+            "close",
+            "closed",
+        }
+        if not (claim_like or has_history_fields):
+            continue
+
         count += 1
-        realized += _safe_float(entry.get("cashPnl") or entry.get("realizedPnl"))
+        realized += _safe_float(
+            entry.get("cashPnl")
+            or entry.get("realizedPnl")
+            or entry.get("payout")
+            or entry.get("payoutAmount")
+            or entry.get("amount")
+            or entry.get("value")
+        )
         percent = (
             entry.get("percentPnl")
             or entry.get("percent_pnl")
@@ -288,30 +356,51 @@ def _summarize_history(entries: Iterable[Dict[str, Any]]) -> HistorySummary:
         if has_pct:
             pct_values.append(pct_val)
 
-        cur_price = _safe_float(
-            entry.get("curPrice")
-            or entry.get("markPrice")
-            or entry.get("avgPrice")
-            or entry.get("finalPrice"),
-            default=0.0,
+        price_fields = (
+            "curPrice",
+            "markPrice",
+            "avgPrice",
+            "finalPrice",
+            "price",
+            "payoutPerToken",
+            "tokenPayout",
+            "perSharePayout",
         )
-        status_text = str(entry.get("status") or entry.get("state") or "").lower()
-        claimed_flag = bool(
-            entry.get("claimed")
-            or entry.get("isClaimed")
-            or entry.get("redeemed")
-            or entry.get("claimTx")
-            or status_text in {"claimed", "redeemed", "closed"}
-        )
-        size_now = _safe_float(entry.get("size") or entry.get("quantity"))
-        if (cur_price <= 0.0001 and claimed_flag) or (claimed_flag and size_now <= 0):
+        cur_price = None
+        for key in price_fields:
+            cur_price = entry.get(key)
+            if cur_price not in (None, ""):
+                cur_price = _safe_float(cur_price)
+                break
+        if cur_price in (None, ""):
+            cur_price = None
+
+        size_now = entry.get("size") or entry.get("quantity") or entry.get("tokens")
+        size_now_val = None
+        if size_now not in (None, ""):
+            size_now_val = _safe_float(size_now)
+
+        zero_reason = None
+        if cur_price is not None and cur_price <= 0.0001:
+            zero_reason = "price"
+        elif size_now_val is not None and size_now_val <= 0:
+            zero_reason = "size"
+
+        if zero_reason:
             zero_markets.append(
                 {
-                    "title": entry.get("title") or entry.get("market") or entry.get("slug"),
+                    "title": entry.get("title")
+                    or entry.get("market")
+                    or entry.get("question")
+                    or entry.get("slug"),
                     "outcome": entry.get("outcome"),
-                    "cashPnl": _safe_float(entry.get("cashPnl") or entry.get("realizedPnl")),
+                    "cashPnl": _safe_float(
+                        entry.get("cashPnl")
+                        or entry.get("realizedPnl")
+                        or entry.get("payout")
+                    ),
                     "percentPnl": pct_val if has_pct else None,
-                    "claimTx": entry.get("claimTx"),
+                    "claimTx": entry.get("claimTx") or entry.get("transactionHash"),
                 }
             )
 
@@ -368,8 +457,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=5,
         help="trades 最大翻页次数",
     )
-    parser.add_argument("--history-limit", type=int, default=500, help="历史仓位每页条数")
-    parser.add_argument("--history-pages", type=int, default=5, help="历史仓位最大翻页次数")
+    parser.add_argument(
+        "--history-limit",
+        type=int,
+        default=500,
+        help="历史仓位每页条数（Data-API /activity，默认500）",
+    )
+    parser.add_argument(
+        "--history-pages",
+        type=int,
+        default=5,
+        help="历史仓位最大翻页次数",
+    )
     args = parser.parse_args(argv)
 
     user = _vp_infer_wallet_address()
