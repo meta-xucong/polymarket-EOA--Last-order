@@ -65,7 +65,8 @@ MARKET_LOOKUP_HOSTS = [host for host in (GAMMA_API_HOST, GAMMA_ALT_HOST) if host
 DISABLE_MARKET_CACHE = bool(os.environ.get("DISABLE_MARKET_CACHE"))
 DEBUG_LOG = False
 
-DEFAULT_SINCE_DATE = "2023-01-01"
+# 默认起始时间保持为 2025-11-13，便于复现对账。额外提供环境变量覆盖以便快速排查
+DEFAULT_SINCE_DATE = os.environ.get("POLY_DEFAULT_SINCE_DATE", "2025-11-13")
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
@@ -828,12 +829,18 @@ def _filter_entries_since(entries: Iterable[Dict[str, Any]], since_ts: float) ->
     return filtered
 
 
-def _prompt_since_date() -> Tuple[str, float]:
-    prompt = (
-        f"请输入查询起始日期（UTC+8，格式YYYY-MM-DD，默认为 {DEFAULT_SINCE_DATE}）："
-    )
-    user_input = input(prompt)
-    date_text = (user_input or "").strip() or DEFAULT_SINCE_DATE
+def _prompt_since_date(preselected_date: Optional[str] = None) -> Tuple[str, float]:
+    """根据用户输入或 CLI 指定的日期生成查询起点。"""
+
+    if preselected_date is None:
+        prompt = (
+            f"请输入查询起始日期（UTC+8，格式YYYY-MM-DD，默认为 {DEFAULT_SINCE_DATE}）："
+        )
+        user_input = input(prompt)
+        date_text = (user_input or "").strip() or DEFAULT_SINCE_DATE
+    else:
+        date_text = preselected_date.strip() or DEFAULT_SINCE_DATE
+
     try:
         base_date = datetime.strptime(date_text, "%Y-%m-%d")
     except ValueError:
@@ -842,6 +849,7 @@ def _prompt_since_date() -> Tuple[str, float]:
         base_date = datetime.strptime(date_text, "%Y-%m-%d")
     aware_dt = base_date.replace(tzinfo=UTC_PLUS_8)
     since_ts = aware_dt.astimezone(timezone.utc).timestamp()  # 强制转换为秒（UTC）
+    print(f"[INFO] 查询起始日期（UTC+8）：{date_text}")
     return date_text, since_ts
 
 
@@ -991,6 +999,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="跳过市场元数据缓存，强制每次请求最新市场信息",
     )
     parser.add_argument(
+        "--since-date",
+        "--since",
+        dest="since_date",
+        help=(
+            "查询起始日期（UTC+8，格式YYYY-MM-DD）。默认取 POLY_DEFAULT_SINCE_DATE 或"
+            f" {DEFAULT_SINCE_DATE}。"
+        ),
+    )
+    parser.add_argument(
         "--trades-limit",
         "--fills-limit",
         dest="trades_limit",
@@ -1036,7 +1053,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[INFO] 使用钱包地址：{user}")
 
     # Get the since_ts value from the user
-    since_date_text, since_ts = _prompt_since_date()
+    since_date_text, since_ts = _prompt_since_date(args.since_date)
 
     try:
         trades = _fetch_trades(
