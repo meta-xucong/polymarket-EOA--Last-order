@@ -13,7 +13,8 @@
 
 使用示例：
     python3 history_positions_summary_EOA.py
-    python3 history_positions_summary_EOA.py --json
+    python3 history_positions_summary_EOA.py --json  # 以 JSON 输出到标准输出
+    python3 history_positions_summary_EOA.py --json positions.json  # 直接保存到文件
 """
 
 from __future__ import annotations
@@ -947,7 +948,13 @@ def _compose_position_rows(
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Polymarket 历史仓位统计工具")
-    parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+    parser.add_argument(
+        "--json",
+        nargs="?",
+        const="-",
+        dest="json_out",
+        help="以 JSON 输出结果；可选路径，默认输出到标准输出",
+    )
     parser.add_argument("--debug", action="store_true", help="输出调试日志，包含接口回包统计")
     parser.add_argument(
         "--no-market-cache",
@@ -1053,7 +1060,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     market_meta = _lookup_markets_for_assets(buy_positions.keys())
     rows = _compose_position_rows(buy_positions, realized_map, market_meta, trade_cashflow)
 
-    if args.json:
+    if args.json_out is not None:
         output = {
             "wallet": user,
             "since_date_utc8": since_date_text,
@@ -1061,7 +1068,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             "trades": filtered_trades,
             "trade_cashflow": trade_cashflow,
         }
-        print(json.dumps(output, ensure_ascii=False, indent=2))
+        serialized = json.dumps(output, ensure_ascii=False, indent=2)
+        json_path = args.json_out
+        if not json_path or json_path == "-":
+            print(serialized)
+        else:
+            with open(json_path, "w", encoding="utf-8") as f:
+                f.write(serialized)
+            print(f"[OK] JSON 已保存：{json_path}")
         return 0
 
     if not rows:

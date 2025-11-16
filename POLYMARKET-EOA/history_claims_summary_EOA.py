@@ -10,7 +10,8 @@
 
 使用示例：
     python3 history_claims_summary_EOA.py
-    python3 history_claims_summary_EOA.py --filter-by trade --json
+    python3 history_claims_summary_EOA.py --json  # 输出到标准输出
+    python3 history_claims_summary_EOA.py --json claims.json --since "2024-10-01"
 """
 
 from __future__ import annotations
@@ -506,7 +507,13 @@ def _print_positions(positions: Dict[str, PositionSummary]) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Polymarket Claim 统计工具（现金流口径）")
-    parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+    parser.add_argument(
+        "--json",
+        nargs="?",
+        const="-",
+        dest="json_out",
+        help="以 JSON 输出结果；可选路径，默认输出到标准输出",
+    )
     parser.add_argument("--debug", action="store_true", help="输出调试日志")
     parser.add_argument(
         "--filter-by",
@@ -559,7 +566,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     positions = _aggregate_positions(scoped_events)
 
-    if args.json:
+    if args.json_out is not None:
         output = {
             "wallet": user,
             "since_date_utc8": since_date_text,
@@ -567,7 +574,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             "claim_events": [evt.__dict__ for evt in redeem_events_since],
             "positions": {k: v.__dict__ for k, v in positions.items()},
         }
-        print(json.dumps(output, ensure_ascii=False, indent=2))
+        serialized = json.dumps(output, ensure_ascii=False, indent=2)
+        json_path = args.json_out
+        if not json_path or json_path == "-":
+            print(serialized)
+        else:
+            with open(json_path, "w", encoding="utf-8") as f:
+                f.write(serialized)
+            print(f"[OK] JSON 已保存：{json_path}")
         return 0
 
     _print_claim_events(redeem_events_since)

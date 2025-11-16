@@ -2,11 +2,17 @@
 # -*- coding: utf-8 -*-
 """融合 claim 与历史持仓的聚合脚本（EOA 版）。
 
-用法示例：
+完整使用流程：
+1) 先生成历史成交 / 仓位 JSON（默认会写到脚本同目录）：
+    python3 history_positions_summary_EOA.py --json positions.json
+2) 再生成 claim JSON（可指定筛选时间）：
+    python3 history_claims_summary_EOA.py --json claims.json --since "2024-10-01"
+3) 最后运行本脚本做融合与导出：
     python3 history_claims_positions_merged_EOA.py \
         --positions-json positions.json \
         --claims-json claims.json \
-        --json-out merged.json
+        --json-out merged.json \
+        --xlsx-out merged.xlsx
 """
 
 from __future__ import annotations
@@ -21,9 +27,15 @@ from typing import Any, Dict, List, Optional
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
-def _load_json(path: str) -> Dict[str, Any]:
+def _load_json(path: str, flag: str) -> Dict[str, Any]:
     if not os.path.exists(path):
-        raise FileNotFoundError(f"未找到文件：{path}")
+        raise FileNotFoundError(
+            "未找到文件：{}\n"
+            "请先运行：\n"
+            "  python3 history_positions_summary_EOA.py --json positions.json\n"
+            "  python3 history_claims_summary_EOA.py --json claims.json [--since YYYY-MM-DD]\n"
+            "并用 --{flag.replace('_', '-')} 指向生成的文件。".format(path, flag=flag)
+        )
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -215,12 +227,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="融合 claim 与历史仓位汇总")
     parser.add_argument(
         "--positions-json",
-        default="positions.json",
+        default=os.path.join(os.path.dirname(__file__), "positions.json"),
         help="history_positions_summary_EOA.py --json 的输出路径",
     )
     parser.add_argument(
         "--claims-json",
-        default="claims.json",
+        default=os.path.join(os.path.dirname(__file__), "claims.json"),
         help="history_claims_summary_EOA.py --json 的输出路径",
     )
     parser.add_argument("--json-out", help="将融合结果导出为 JSON")
@@ -228,12 +240,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        positions_payload = _load_json(args.positions_json)
+        positions_payload = _load_json(args.positions_json, "positions_json")
     except Exception as exc:
         print(f"[ERR] 读取 positions JSON 失败：{exc}", file=sys.stderr)
         return 2
     try:
-        claims_payload = _load_json(args.claims_json)
+        claims_payload = _load_json(args.claims_json, "claims_json")
     except Exception as exc:
         print(f"[ERR] 读取 claims JSON 失败：{exc}", file=sys.stderr)
         return 3
