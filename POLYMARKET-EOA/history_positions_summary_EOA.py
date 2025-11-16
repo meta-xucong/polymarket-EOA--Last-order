@@ -65,7 +65,7 @@ MARKET_LOOKUP_HOSTS = [host for host in (GAMMA_API_HOST, GAMMA_ALT_HOST) if host
 DISABLE_MARKET_CACHE = bool(os.environ.get("DISABLE_MARKET_CACHE"))
 DEBUG_LOG = False
 
-DEFAULT_SINCE_DATE = "2025-11-13"
+DEFAULT_SINCE_DATE = "2023-01-01"
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
@@ -1020,6 +1020,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 4
     _debug_print(f"/trades 返回 {len(trades)} 条记录（含 BUY/SELL）")
 
+    earliest_trade_ts: Optional[float] = None
+    for trade in trades:
+        ts = _entry_timestamp(trade)
+        if ts is None:
+            continue
+        if earliest_trade_ts is None or ts < earliest_trade_ts:
+            earliest_trade_ts = ts
+
     history_entries: List[Dict[str, Any]] = []
     try:
         history_entries.extend(
@@ -1054,19 +1062,58 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"过滤时间 {since_date_text} 后：trades={len(filtered_trades)} | history={len(filtered_history)}"
     )
 
+    if trades and not filtered_trades:
+        earliest_trade_text = (
+            _fmt_timestamp_local(earliest_trade_ts) if earliest_trade_ts is not None else "-"
+        )
+        print(
+            f"[WARN] 起始日期 {since_date_text} 过滤掉了所有成交记录，"
+            f"最早成交时间（UTC+8）约为 {earliest_trade_text}，请使用更早的起始日期。"
+        )
+
     buy_positions = _summarize_buy_trades(filtered_trades)
     trade_cashflow = _summarize_trade_cashflow(filtered_trades)
     realized_map = _summarize_activity(filtered_history)
+
+    claim_only_assets = {
+        asset
+        for asset, info in realized_map.items()
+        if asset not in buy_positions
+        and (info.get("was_claimed") or isinstance(info.get("claim_amount"), (int, float)))
+    }
+
     market_meta = _lookup_markets_for_assets(buy_positions.keys())
     rows = _compose_position_rows(buy_positions, realized_map, market_meta, trade_cashflow)
 
+    claim_only_meta: Dict[str, Dict[str, Any]] = {}
+    if claim_only_assets:
+        claim_only_meta = _lookup_markets_for_assets(claim_only_assets)
+
     if args.json_out is not None:
+        claim_only_markets: List[Dict[str, Any]] = []
+        for asset in claim_only_assets:
+            info = realized_map.get(asset) or {}
+            meta = claim_only_meta.get(asset) or {}
+            claim_only_markets.append(
+                {
+                    "asset": asset,
+                    "title": meta.get("market_title") or meta.get("slug") or meta.get("market_slug") or "",
+                    "outcome": meta.get("token_label") or info.get("resolved_outcome") or "",
+                    "claimAmount": info.get("claim_amount"),
+                    "resolvedOutcome": info.get("resolved_outcome"),
+                    "resolutionTime": info.get("timestamp"),
+                    "resolutionStatus": info.get("status"),
+                    "source": info.get("source"),
+                }
+            )
+
         output = {
             "wallet": user,
             "since_date_utc8": since_date_text,
             "positions": rows,
             "trades": filtered_trades,
             "trade_cashflow": trade_cashflow,
+            "claim_only_markets": claim_only_markets,
         }
         serialized = json.dumps(output, ensure_ascii=False, indent=2)
         json_path = args.json_out
@@ -1168,6 +1215,27 @@ def main(argv: Optional[List[str]] = None) -> int:
             _vp_fmt_money(total_invest), _vp_fmt_money(total_profit), roi
         )
     )
+
+    if claim_only_assets:
+        claim_only_count = len(claim_only_assets)
+        claim_only_amount = 0.0
+        for asset in claim_only_assets:
+            entry = realized_map.get(asset) or {}
+            amt = entry.get("claim_amount")
+            if isinstance(amt, (int, float)):
+                claim_only_amount += float(amt)
+        print(
+            "\n[INFO] 仅发现 claim 记录、缺少买入/成交数据的市场：{} 个 | 领取总额≈{}".format(
+                claim_only_count, _vp_fmt_money(claim_only_amount)
+            )
+        )
+        for asset in sorted(claim_only_assets):
+            meta = claim_only_meta.get(asset) or {}
+            title = meta.get("market_title") or meta.get("market_slug") or asset
+            outcome = meta.get("token_label") or "-"
+            claim_amount = realized_map.get(asset, {}).get("claim_amount")
+            claim_text = _vp_fmt_money(claim_amount) if isinstance(claim_amount, (int, float)) else "-"
+            print(f" - {title} | {outcome} | token_id={asset} | claim≈{claim_text}")
 
     if unresolved_but_marked:
         print("\n[WARN] 以下市场被标记为已结算，但未能从 Gamma 数据推断赢家：")
