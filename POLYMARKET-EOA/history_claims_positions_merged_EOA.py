@@ -54,12 +54,13 @@ def _canonicalize_key(
 
 def _load_json(path: str, flag: str) -> Dict[str, Any]:
     if not os.path.exists(path):
+        cli_flag = flag.replace("_", "-")
         raise FileNotFoundError(
             "未找到文件：{}\n"
             "请先运行：\n"
             "  python3 history_positions_summary_EOA.py --json positions.json\n"
             "  python3 history_claims_summary_EOA.py --json claims.json [--since YYYY-MM-DD]\n"
-            "并用 --{flag.replace('_', '-')} 指向生成的文件。".format(path, flag=flag)
+            "并用 --{} 指向生成的文件。".format(path, cli_flag)
         )
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -219,6 +220,37 @@ def _print_merged(rows: List[Dict[str, Any]]) -> None:
         print()
 
 
+def _print_summary(rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+
+    settled_rows = [r for r in rows if r.get("has_claim")]
+    unsettled_rows = [r for r in rows if not r.get("has_claim")]
+
+    total_entries = len(rows)
+    settled_entries = len(settled_rows)
+    unsettled_entries = len(unsettled_rows)
+
+    total_invest = sum(float(r.get("buy_cost_total") or 0.0) for r in settled_rows)
+    total_profit = sum(float(r.get("net_cash_flow") or 0.0) for r in settled_rows)
+    success_count = sum(
+        1 for r in settled_rows if float(r.get("net_cash_flow") or 0.0) >= 0
+    )
+    failure_count = settled_entries - success_count
+    roi = (total_profit / total_invest * 100) if total_invest > 0 else 0.0
+
+    print("[SUMMARY] 统计概览：")
+    print(
+        f"总条目={total_entries} | 已结算={settled_entries} | 未结算={unsettled_entries}"
+    )
+    print(f"命中={success_count} | 失利={failure_count}（仅统计已结算）")
+    print(
+        "总投入≈{:.2f} | 总收益≈{:.2f} | 总收益率≈{:.2f}%（仅已结算）".format(
+            total_invest, total_profit, roi
+        )
+    )
+
+
 def _export_json(rows: List[Dict[str, Any]], path: str) -> None:
     payload = {"merged": rows}
     with open(path, "w", encoding="utf-8") as f:
@@ -311,6 +343,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     merged_rows = _merge_positions_and_claims(positions_payload, claims_payload)
     _print_merged(merged_rows)
+    _print_summary(merged_rows)
 
     if args.json_out:
         _export_json(merged_rows, args.json_out)
