@@ -301,6 +301,33 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
             )
             meta["token_side"] = entry.get("type") or entry.get("side") or entry.get("position") or ""
             break
+
+    # 在缺乏显式赢家字段时，用 Gamma 文档明确提供的 outcomes + outcomePrices 推断赢家。
+    if not meta["market_win_outcome"]:
+        price_candidates = market.get("outcomePrices") or market.get("outcome_prices")
+        price_list: List[Optional[float]] = []
+        for item in _coerce_list(price_candidates):
+            price_list.append(_optional_float(item))
+
+        # 仅在市场已关闭或标记为已结算时尝试推断，避免进行中的市场被误判。
+        closed_flag = bool(market.get("closed") or market.get("isClosed"))
+        uma_status = str(market.get("umaResolutionStatus") or "").lower()
+        resolved_like = closed_flag or "resolve" in uma_status or "settle" in uma_status
+
+        if resolved_like and outcome_names and price_list and len(outcome_names) == len(price_list):
+            winners_idx = [i for i, price in enumerate(price_list) if isinstance(price, float) and price >= 0.99]
+            if not winners_idx:
+                # 若没有明显的 ~1.0 价格，则选取价格最高的 outcome 作为候选。
+                max_price = max([p for p in price_list if isinstance(p, float)], default=None)
+                if isinstance(max_price, float) and max_price >= 0.5:
+                    winners_idx = [i for i, price in enumerate(price_list) if price == max_price]
+
+            if winners_idx:
+                winners = [outcome_names[i] for i in winners_idx]
+                if meta["token_index"] in winners_idx and meta["token_label"]:
+                    meta["market_win_outcome"] = meta["token_label"]
+                else:
+                    meta["market_win_outcome"] = winners[0]
     return meta
 
 def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
@@ -605,12 +632,16 @@ def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str
         else:
             priority = 1
 
+        # 注意：/activity 等接口中的 ``outcome`` 字段通常表示“用户买入的方向”，
+        # 而非市场最终结果。如果把它当成 resolved outcome，会把亏损仓位误判为
+        # 中奖（例如买了 "No"，activity 里 outcome=No，但市场实际结算为 Yes）。
+        # 因此只信任显式的 resolved / winning 相关字段。
         info = {
             "asset": asset,
             "status": entry.get("status") or entry.get("type") or entry.get("action") or "",
             "resolved_outcome": entry.get("winningOutcome")
             or entry.get("resolvedOutcome")
-            or entry.get("outcome")
+            or entry.get("resolveOutcome")
             or entry.get("result"),
             "cash_pnl": _extract_cash_pnl(entry),
             "claim_amount": claim_amount,
@@ -686,10 +717,7 @@ def _compose_position_rows(
         resolved_ts = realized_entry.get("timestamp") if realized_entry else None
         market_meta = markets.get(asset)
         token_meta = _resolve_token_meta(asset, market_meta)
-        activity_outcome = (
-            realized_entry.get("resolved_outcome") if realized_entry else None
-        )
-        resolved_outcome = activity_outcome or token_meta.get("market_win_outcome") or None
+        resolved_outcome = token_meta.get("market_win_outcome") or None
         rows.append(
             {
                 "asset": asset,
@@ -706,9 +734,7 @@ def _compose_position_rows(
                 "resolutionTime": resolved_ts,
                 "resolutionStatus": realized_entry.get("status") if realized_entry else None,
                 "resolvedOutcome": resolved_outcome,
-                "resolvedOutcomeSource": "activity"
-                if activity_outcome
-                else ("market" if resolved_outcome else None),
+                "resolvedOutcomeSource": "market" if resolved_outcome else None,
                 "realizedPnl": realized_entry.get("cash_pnl") if realized_entry else None,
                 "claimAmount": realized_entry.get("claim_amount") if realized_entry else None,
                 "settlementPrice": realized_entry.get("settlement_price") if realized_entry else None,
