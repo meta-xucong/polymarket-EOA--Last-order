@@ -579,6 +579,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not json_path or json_path == "-":
             print(serialized)
         else:
+            if not os.path.isabs(json_path):
+                script_dir = os.path.abspath(os.path.dirname(__file__))
+                json_path = os.path.join(script_dir, json_path)
             with open(json_path, "w", encoding="utf-8") as f:
                 f.write(serialized)
             print(f"[OK] JSON 已保存：{json_path}")
