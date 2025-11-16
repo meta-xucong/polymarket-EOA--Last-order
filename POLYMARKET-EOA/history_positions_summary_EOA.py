@@ -304,6 +304,36 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
         or "closed" in status_text
     )
 
+    status_text = str(market.get("status") or market.get("state") or "").lower()
+    resolved_ts = _normalize_timestamp(
+        _first_present(
+            market,
+            (
+                "resolvedTime",
+                "resolveTime",
+                "resolutionTime",
+                "resolvedAt",
+                "closedTime",
+                "closedAt",
+                "endTime",
+                "endDate",
+                "expiry",
+                "expiration",
+            ),
+        )
+    )
+    closed_flag = bool(market.get("closed") or market.get("isClosed"))
+    uma_status = str(market.get("umaResolutionStatus") or "").lower()
+    meta["market_resolved"] = bool(
+        meta["market_win_outcome"]
+        or closed_flag
+        or (resolved_ts is not None)
+        or "resolve" in uma_status
+        or "settle" in uma_status
+        or "resolved" in status_text
+        or "closed" in status_text
+    )
+
     clob_ids = _extract_clob_ids(market)
     outcome_names = _extract_outcome_names(market)
     asset_str = str(asset or "").strip()
