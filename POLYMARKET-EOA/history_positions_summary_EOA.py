@@ -65,7 +65,7 @@ MARKET_LOOKUP_HOSTS = [host for host in (GAMMA_API_HOST, GAMMA_ALT_HOST) if host
 DISABLE_MARKET_CACHE = bool(os.environ.get("DISABLE_MARKET_CACHE"))
 DEBUG_LOG = False
 
-DEFAULT_SINCE_DATE = "2025-11-13"
+DEFAULT_SINCE_DATE = "2023-01-01"
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
