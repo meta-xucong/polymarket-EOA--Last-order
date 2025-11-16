@@ -22,9 +22,34 @@ import json
 import os
 import sys
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
+
+
+def _condition_id_of(entry: Dict[str, Any]) -> str:
+    return str(
+        entry.get("conditionId")
+        or entry.get("condition_id")
+        or entry.get("conditionID")
+        or ""
+    ).strip()
+
+
+def _is_placeholder_key(key: str) -> bool:
+    text = str(key or "")
+    return text.startswith("UNKNOWN#") or text.endswith("#UNK") or text.endswith("#999")
+
+
+def _canonicalize_key(
+    raw_key: str, condition_id: str, cond_to_pos_keys: Dict[str, Set[str]]
+) -> str:
+    key = str(raw_key or "")
+    if _is_placeholder_key(key) and condition_id:
+        pos_keys = cond_to_pos_keys.get(condition_id)
+        if pos_keys and len(pos_keys) == 1:
+            return next(iter(pos_keys))
+    return key
 
 
 def _load_json(path: str, flag: str) -> Dict[str, Any]:
@@ -58,14 +83,48 @@ def _merge_positions_and_claims(
         for p in positions_payload.get("positions", [])
         if isinstance(p, dict) and p.get("key")
     }
-    claim_pos_by_key = {
-        str(p.get("key")): p
-        for p in (claims_payload.get("positions") or {}).values()
-        if isinstance(p, dict) and p.get("key")
-    }
-    claim_events: List[Dict[str, Any]] = [
-        e for e in claims_payload.get("claim_events", []) if isinstance(e, dict)
-    ]
+    cond_to_pos_keys: Dict[str, Set[str]] = {}
+    for key, pos in pos_by_key.items():
+        cid = _condition_id_of(pos)
+        if cid:
+            cond_to_pos_keys.setdefault(cid, set()).add(key)
+
+    claim_pos_by_key: Dict[str, Dict[str, Any]] = {}
+    for p in (claims_payload.get("positions") or {}).values():
+        if not (isinstance(p, dict) and p.get("key")):
+            continue
+        cid = _condition_id_of(p)
+        canonical_key = _canonicalize_key(p.get("key"), cid, cond_to_pos_keys)
+        normalized = dict(p)
+        normalized["key"] = canonical_key
+        existing = claim_pos_by_key.get(canonical_key)
+        if existing:
+            for field in (
+                "buy_size_total",
+                "buy_cost_total",
+                "sell_size_total",
+                "sell_proceeds_total",
+                "redeem_size_total",
+                "redeem_usdc_total",
+            ):
+                existing[field] = float(existing.get(field, 0.0)) + float(
+                    normalized.get(field, 0.0)
+                )
+            for meta_field in ("title", "slug", "outcome", "side"):
+                if not existing.get(meta_field) and normalized.get(meta_field):
+                    existing[meta_field] = normalized.get(meta_field)
+        else:
+            claim_pos_by_key[canonical_key] = normalized
+
+    claim_events: List[Dict[str, Any]] = []
+    for e in claims_payload.get("claim_events", []):
+        if not isinstance(e, dict):
+            continue
+        cid = _condition_id_of(e)
+        canonical_key = _canonicalize_key(e.get("key"), cid, cond_to_pos_keys)
+        normalized = dict(e)
+        normalized["key"] = canonical_key
+        claim_events.append(normalized)
 
     all_keys = sorted(set(pos_by_key) | set(claim_pos_by_key))
     merged: List[Dict[str, Any]] = []
@@ -121,7 +180,7 @@ def _merge_positions_and_claims(
                 "redeem_size_total": float(redeem_size or 0.0),
                 "redeem_usdc_total": float(redeem_usdc or 0.0),
                 "net_cash_flow": net_cash_flow,
-                "has_claim": float(redeem_usdc or 0.0) > 0,
+                "has_claim": bool(claim_ts_list) or float(redeem_usdc or 0.0) > 0,
                 "has_position_info": base is not None,
                 "first_claim_ts": first_claim_ts,
                 "last_claim_ts": last_claim_ts,
