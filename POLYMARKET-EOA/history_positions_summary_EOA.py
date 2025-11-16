@@ -65,7 +65,8 @@ MARKET_LOOKUP_HOSTS = [host for host in (GAMMA_API_HOST, GAMMA_ALT_HOST) if host
 DISABLE_MARKET_CACHE = bool(os.environ.get("DISABLE_MARKET_CACHE"))
 DEBUG_LOG = False
 
-DEFAULT_SINCE_DATE = "2025-11-13"
+# 默认起始时间保持为 2025-11-13，便于复现对账。额外提供环境变量覆盖以便快速排查
+DEFAULT_SINCE_DATE = os.environ.get("POLY_DEFAULT_SINCE_DATE", "2025-11-13")
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
@@ -828,12 +829,18 @@ def _filter_entries_since(entries: Iterable[Dict[str, Any]], since_ts: float) ->
     return filtered
 
 
-def _prompt_since_date() -> Tuple[str, float]:
-    prompt = (
-        f"请输入查询起始日期（UTC+8，格式YYYY-MM-DD，默认为 {DEFAULT_SINCE_DATE}）："
-    )
-    user_input = input(prompt)
-    date_text = (user_input or "").strip() or DEFAULT_SINCE_DATE
+def _prompt_since_date(preselected_date: Optional[str] = None) -> Tuple[str, float]:
+    """根据用户输入或 CLI 指定的日期生成查询起点。"""
+
+    if preselected_date is None:
+        prompt = (
+            f"请输入查询起始日期（UTC+8，格式YYYY-MM-DD，默认为 {DEFAULT_SINCE_DATE}）："
+        )
+        user_input = input(prompt)
+        date_text = (user_input or "").strip() or DEFAULT_SINCE_DATE
+    else:
+        date_text = preselected_date.strip() or DEFAULT_SINCE_DATE
+
     try:
         base_date = datetime.strptime(date_text, "%Y-%m-%d")
     except ValueError:
@@ -842,7 +849,37 @@ def _prompt_since_date() -> Tuple[str, float]:
         base_date = datetime.strptime(date_text, "%Y-%m-%d")
     aware_dt = base_date.replace(tzinfo=UTC_PLUS_8)
     since_ts = aware_dt.astimezone(timezone.utc).timestamp()  # 强制转换为秒（UTC）
+    print(f"[INFO] 查询起始日期（UTC+8）：{date_text}")
     return date_text, since_ts
+
+
+def _print_claim_only_summary(
+    claim_only_assets: Set[str],
+    claim_only_meta: Dict[str, Dict[str, Any]],
+    realized_map: Dict[str, Dict[str, Any]],
+) -> None:
+    if not claim_only_assets:
+        return
+
+    claim_only_count = len(claim_only_assets)
+    claim_only_amount = 0.0
+    for asset in claim_only_assets:
+        entry = realized_map.get(asset) or {}
+        amt = entry.get("claim_amount")
+        if isinstance(amt, (int, float)):
+            claim_only_amount += float(amt)
+    print(
+        "\n[INFO] 仅发现 claim 记录、缺少买入/成交数据的市场：{} 个 | 领取总额≈{}".format(
+            claim_only_count, _vp_fmt_money(claim_only_amount)
+        )
+    )
+    for asset in sorted(claim_only_assets):
+        meta = claim_only_meta.get(asset) or {}
+        title = meta.get("market_title") or meta.get("market_slug") or asset
+        outcome = meta.get("token_label") or "-"
+        claim_amount = realized_map.get(asset, {}).get("claim_amount")
+        claim_text = _vp_fmt_money(claim_amount) if isinstance(claim_amount, (int, float)) else "-"
+        print(f" - {title} | {outcome} | token_id={asset} | claim≈{claim_text}")
 
 
 def _compose_position_rows(
@@ -962,6 +999,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="跳过市场元数据缓存，强制每次请求最新市场信息",
     )
     parser.add_argument(
+        "--since-date",
+        "--since",
+        dest="since_date",
+        help=(
+            "查询起始日期（UTC+8，格式YYYY-MM-DD）。默认取 POLY_DEFAULT_SINCE_DATE 或"
+            f" {DEFAULT_SINCE_DATE}。"
+        ),
+    )
+    parser.add_argument(
         "--trades-limit",
         "--fills-limit",
         dest="trades_limit",
@@ -1007,7 +1053,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[INFO] 使用钱包地址：{user}")
 
     # Get the since_ts value from the user
-    since_date_text, since_ts = _prompt_since_date()
+    since_date_text, since_ts = _prompt_since_date(args.since_date)
 
     try:
         trades = _fetch_trades(
@@ -1019,6 +1065,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERR] 获取历史成交失败：{exc}", file=sys.stderr)
         return 4
     _debug_print(f"/trades 返回 {len(trades)} 条记录（含 BUY/SELL）")
+
+    earliest_trade_ts: Optional[float] = None
+    for trade in trades:
+        ts = _entry_timestamp(trade)
+        if ts is None:
+            continue
+        if earliest_trade_ts is None or ts < earliest_trade_ts:
+            earliest_trade_ts = ts
 
     history_entries: List[Dict[str, Any]] = []
     try:
@@ -1054,19 +1108,58 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"过滤时间 {since_date_text} 后：trades={len(filtered_trades)} | history={len(filtered_history)}"
     )
 
+    if trades and not filtered_trades:
+        earliest_trade_text = (
+            _fmt_timestamp_local(earliest_trade_ts) if earliest_trade_ts is not None else "-"
+        )
+        print(
+            f"[WARN] 起始日期 {since_date_text} 过滤掉了所有成交记录，"
+            f"最早成交时间（UTC+8）约为 {earliest_trade_text}，请使用更早的起始日期。"
+        )
+
     buy_positions = _summarize_buy_trades(filtered_trades)
     trade_cashflow = _summarize_trade_cashflow(filtered_trades)
     realized_map = _summarize_activity(filtered_history)
+
+    claim_only_assets = {
+        asset
+        for asset, info in realized_map.items()
+        if asset not in buy_positions
+        and (info.get("was_claimed") or isinstance(info.get("claim_amount"), (int, float)))
+    }
+
     market_meta = _lookup_markets_for_assets(buy_positions.keys())
     rows = _compose_position_rows(buy_positions, realized_map, market_meta, trade_cashflow)
 
+    claim_only_meta: Dict[str, Dict[str, Any]] = {}
+    if claim_only_assets:
+        claim_only_meta = _lookup_markets_for_assets(claim_only_assets)
+
     if args.json_out is not None:
+        claim_only_markets: List[Dict[str, Any]] = []
+        for asset in claim_only_assets:
+            info = realized_map.get(asset) or {}
+            meta = claim_only_meta.get(asset) or {}
+            claim_only_markets.append(
+                {
+                    "asset": asset,
+                    "title": meta.get("market_title") or meta.get("slug") or meta.get("market_slug") or "",
+                    "outcome": meta.get("token_label") or info.get("resolved_outcome") or "",
+                    "claimAmount": info.get("claim_amount"),
+                    "resolvedOutcome": info.get("resolved_outcome"),
+                    "resolutionTime": info.get("timestamp"),
+                    "resolutionStatus": info.get("status"),
+                    "source": info.get("source"),
+                }
+            )
+
         output = {
             "wallet": user,
             "since_date_utc8": since_date_text,
             "positions": rows,
             "trades": filtered_trades,
             "trade_cashflow": trade_cashflow,
+            "claim_only_markets": claim_only_markets,
         }
         serialized = json.dumps(output, ensure_ascii=False, indent=2)
         json_path = args.json_out
@@ -1083,6 +1176,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not rows:
         print("[INFO] 在指定区间内没有买入记录。")
+        _print_claim_only_summary(claim_only_assets, claim_only_meta, realized_map)
         return 0
 
     print("\n[HISTORY] 历史买入持仓（含结算盈亏）：")
@@ -1168,6 +1262,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             _vp_fmt_money(total_invest), _vp_fmt_money(total_profit), roi
         )
     )
+
+    _print_claim_only_summary(claim_only_assets, claim_only_meta, realized_map)
 
     if unresolved_but_marked:
         print("\n[WARN] 以下市场被标记为已结算，但未能从 Gamma 数据推断赢家：")
