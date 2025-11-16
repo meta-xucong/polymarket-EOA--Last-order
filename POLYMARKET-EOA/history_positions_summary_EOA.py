@@ -246,6 +246,7 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
         "market_win_outcome": "",
         "market_slug": "",
         "market_title": "",
+        "market_resolved": False,
     }
     if not market:
         return meta
@@ -268,6 +269,36 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
         or market.get("resolveOutcome")
         or market.get("result")
         or ""
+    )
+
+    status_text = str(market.get("status") or market.get("state") or "").lower()
+    resolved_ts = _normalize_timestamp(
+        _first_present(
+            market,
+            (
+                "resolvedTime",
+                "resolveTime",
+                "resolutionTime",
+                "resolvedAt",
+                "closedTime",
+                "closedAt",
+                "endTime",
+                "endDate",
+                "expiry",
+                "expiration",
+            ),
+        )
+    )
+    closed_flag = bool(market.get("closed") or market.get("isClosed"))
+    uma_status = str(market.get("umaResolutionStatus") or "").lower()
+    meta["market_resolved"] = bool(
+        meta["market_win_outcome"]
+        or closed_flag
+        or (resolved_ts is not None)
+        or "resolve" in uma_status
+        or "settle" in uma_status
+        or "resolved" in status_text
+        or "closed" in status_text
     )
 
     clob_ids = _extract_clob_ids(market)
@@ -310,9 +341,7 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
             price_list.append(_optional_float(item))
 
         # 仅在市场已关闭或标记为已结算时尝试推断，避免进行中的市场被误判。
-        closed_flag = bool(market.get("closed") or market.get("isClosed"))
-        uma_status = str(market.get("umaResolutionStatus") or "").lower()
-        resolved_like = closed_flag or "resolve" in uma_status or "settle" in uma_status
+        resolved_like = meta["market_resolved"]
 
         if resolved_like and outcome_names and price_list and len(outcome_names) == len(price_list):
             winners_idx = [i for i, price in enumerate(price_list) if isinstance(price, float) and price >= 0.99]
@@ -329,6 +358,28 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
                 else:
                     meta["market_win_outcome"] = winners[0]
     return meta
+
+
+def _market_resolution_timestamp(market: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not isinstance(market, dict):
+        return None
+    return _normalize_timestamp(
+        _first_present(
+            market,
+            (
+                "resolvedTime",
+                "resolveTime",
+                "resolutionTime",
+                "resolvedAt",
+                "closedTime",
+                "closedAt",
+                "endTime",
+                "endDate",
+                "expiry",
+                "expiration",
+            ),
+        )
+    )
 
 def _fetch_trades(user: str, limit: int, max_pages: int) -> List[Dict[str, Any]]:
     """拉取用户的历史成交数据，分页获取"""
@@ -639,10 +690,10 @@ def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str
         info = {
             "asset": asset,
             "status": entry.get("status") or entry.get("type") or entry.get("action") or "",
+            # 仅保留显式的 resolved / winning 字段，不再从 activity outcome 猜测。
             "resolved_outcome": entry.get("winningOutcome")
             or entry.get("resolvedOutcome")
-            or entry.get("resolveOutcome")
-            or entry.get("result"),
+            or entry.get("resolveOutcome"),
             "cash_pnl": _extract_cash_pnl(entry),
             "claim_amount": claim_amount,
             "settlement_price": settlement_price,
@@ -714,10 +765,19 @@ def _compose_position_rows(
     rows: List[Dict[str, Any]] = []
     for asset, bucket in positions.items():
         realized_entry = realized.get(asset)
-        resolved_ts = realized_entry.get("timestamp") if realized_entry else None
         market_meta = markets.get(asset)
         token_meta = _resolve_token_meta(asset, market_meta)
+        resolved_ts = None
+        if realized_entry and realized_entry.get("timestamp") is not None:
+            resolved_ts = realized_entry.get("timestamp")
+        elif token_meta.get("market_resolved"):
+            resolved_ts = _market_resolution_timestamp(market_meta)
         resolved_outcome = token_meta.get("market_win_outcome") or None
+        resolution_status = None
+        if realized_entry:
+            resolution_status = realized_entry.get("status")
+        if not resolution_status:
+            resolution_status = "已结算" if token_meta.get("market_resolved") else None
         rows.append(
             {
                 "asset": asset,
@@ -732,7 +792,7 @@ def _compose_position_rows(
                 "firstBuyTime": bucket.first_ts,
                 "lastBuyTime": bucket.last_ts,
                 "resolutionTime": resolved_ts,
-                "resolutionStatus": realized_entry.get("status") if realized_entry else None,
+                "resolutionStatus": resolution_status,
                 "resolvedOutcome": resolved_outcome,
                 "resolvedOutcomeSource": "market" if resolved_outcome else None,
                 "realizedPnl": realized_entry.get("cash_pnl") if realized_entry else None,
@@ -741,6 +801,7 @@ def _compose_position_rows(
                 "isResolved": bool(
                     (realized_entry.get("is_resolved") if realized_entry else None)
                     or resolved_outcome
+                    or token_meta.get("market_resolved")
                 ),
                 "wasClaimed": realized_entry.get("was_claimed") if realized_entry else False,
                 "tokenOutcomeLabel": token_meta.get("token_label") or bucket.outcome or "",
@@ -889,6 +950,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     failure_count = 0
     total_invest = 0.0
     total_profit = 0.0
+    unresolved_but_marked = []
 
     for idx, row in enumerate(rows, 1):
         total_size = row.get("totalSize") or 0.0
@@ -944,6 +1006,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             print("    推导结算：-")
 
+        if row.get("isResolved") and not row.get("resolvedOutcome"):
+            unresolved_but_marked.append(
+                {
+                    "title": row.get("title") or row.get("marketSlug") or row.get("asset"),
+                    "asset": row.get("asset"),
+                    "reason": "市场元数据表明已结算，但未能确定赢家（缺少 winningOutcome/outcomePrices）",
+                }
+            )
+
         print()
 
     print("\n[SUMMARY] 统计概览：")
@@ -956,6 +1027,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             _vp_fmt_money(total_invest), _vp_fmt_money(total_profit), roi
         )
     )
+
+    if unresolved_but_marked:
+        print("\n[WARN] 以下市场被标记为已结算，但未能从 Gamma 数据推断赢家：")
+        for item in unresolved_but_marked:
+            print(
+                f" - {item.get('title') or '-'} (token_id={item.get('asset')}) | {item.get('reason')}"
+            )
 
     return 0
 
