@@ -28,6 +28,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 import requests
 
+from key_utils import make_key
+
 
 try:  # 直接复用 view_positions_EOA 内的配置 / 工具
     from view_positions_EOA import (  # type: ignore
@@ -672,6 +674,35 @@ def _summarize_buy_trades(trades: Iterable[Dict[str, Any]]) -> Dict[str, BuyPosi
     return summary
 
 
+def _summarize_trade_cashflow(trades: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """按照 token 统计买卖成交的数量与现金流。"""
+
+    summary: Dict[str, Dict[str, float]] = {}
+    for trade in trades:
+        asset = _extract_asset_id(trade)
+        if not asset:
+            continue
+        side = (trade.get("side") or "").upper()
+        size = _safe_float(trade.get("size"))
+        price = _safe_float(trade.get("price"))
+        bucket = summary.setdefault(
+            asset,
+            {
+                "buy_size_total": 0.0,
+                "buy_cost_total": 0.0,
+                "sell_size_total": 0.0,
+                "sell_proceeds_total": 0.0,
+            },
+        )
+        if side == "BUY":
+            bucket["buy_size_total"] += size
+            bucket["buy_cost_total"] += size * price
+        elif side == "SELL":
+            bucket["sell_size_total"] += size
+            bucket["sell_proceeds_total"] += size * price
+    return summary
+
+
 def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     resolved: Dict[str, Dict[str, Any]] = {}
     claim_keys = (
@@ -817,6 +848,7 @@ def _compose_position_rows(
     positions: Dict[str, BuyPosition],
     realized: Dict[str, Dict[str, Any]],
     markets: Dict[str, Dict[str, Any]],
+    trade_cashflow: Dict[str, Dict[str, float]],
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for asset, bucket in positions.items():
@@ -836,17 +868,27 @@ def _compose_position_rows(
             resolution_status = realized_entry.get("status")
         if not resolution_status:
             resolution_status = "已结算" if token_meta.get("market_resolved") else None
+        outcome_label = bucket.outcome or token_meta.get("token_label") or ""
+        key = make_key(bucket.condition_id, token_meta.get("token_index"), outcome_label)
+        trade_stats = trade_cashflow.get(asset, {})
         rows.append(
             {
+                "key": key,
+                "token_id": asset,
                 "asset": asset,
                 "title": bucket.title or token_meta.get("market_title") or "",
-                "outcome": bucket.outcome or token_meta.get("token_label") or "",
+                "outcome": outcome_label,
+                "side": token_meta.get("token_side") or None,
                 "marketSlug": bucket.market_slug or token_meta.get("market_slug") or "",
                 "conditionId": bucket.condition_id,
                 "icon": bucket.icon,
                 "totalSize": bucket.total_size,
                 "avgEntryPrice": bucket.avg_price,
                 "totalCost": bucket.total_cost,
+                "buy_size_total": trade_stats.get("buy_size_total", 0.0),
+                "buy_cost_total": trade_stats.get("buy_cost_total", 0.0),
+                "sell_size_total": trade_stats.get("sell_size_total", 0.0),
+                "sell_proceeds_total": trade_stats.get("sell_proceeds_total", 0.0),
                 "firstBuyTime": bucket.first_ts,
                 "lastBuyTime": bucket.last_ts,
                 "resolutionTime": resolved_ts,
@@ -1006,9 +1048,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     buy_positions = _summarize_buy_trades(filtered_trades)
+    trade_cashflow = _summarize_trade_cashflow(filtered_trades)
     realized_map = _summarize_activity(filtered_history)
     market_meta = _lookup_markets_for_assets(buy_positions.keys())
-    rows = _compose_position_rows(buy_positions, realized_map, market_meta)
+    rows = _compose_position_rows(buy_positions, realized_map, market_meta, trade_cashflow)
 
     if args.json:
         output = {
@@ -1016,6 +1059,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "since_date_utc8": since_date_text,
             "positions": rows,
             "trades": filtered_trades,
+            "trade_cashflow": trade_cashflow,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
