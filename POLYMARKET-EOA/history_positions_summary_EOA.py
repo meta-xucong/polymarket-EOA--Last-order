@@ -244,6 +244,7 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
         "token_label": "",
         "token_side": "",
         "market_win_outcome": "",
+        "market_win_source": "",
         "market_slug": "",
         "market_title": "",
         "market_resolved": False,
@@ -270,6 +271,8 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
         or market.get("result")
         or ""
     )
+    if meta["market_win_outcome"]:
+        meta["market_win_source"] = "explicit"
 
     status_text = str(market.get("status") or market.get("state") or "").lower()
     resolved_ts = _normalize_timestamp(
@@ -357,6 +360,7 @@ def _resolve_token_meta(asset: str, market: Optional[Dict[str, Any]]) -> Dict[st
                     meta["market_win_outcome"] = meta["token_label"]
                 else:
                     meta["market_win_outcome"] = winners[0]
+                meta["market_win_source"] = "price"
     return meta
 
 
@@ -793,7 +797,11 @@ def _compose_position_rows(
         if realized_entry and realized_entry.get("is_resolved"):
             resolution_status = realized_entry.get("status")
         if not resolution_status:
-            resolution_status = "已结算" if token_meta.get("market_resolved") else None
+            if token_meta.get("market_resolved"):
+                if resolved_outcome:
+                    resolution_status = "已结算"
+                else:
+                    resolution_status = "已结算(缺赢家)"
         rows.append(
             {
                 "asset": asset,
@@ -810,7 +818,11 @@ def _compose_position_rows(
                 "resolutionTime": resolved_ts,
                 "resolutionStatus": resolution_status,
                 "resolvedOutcome": resolved_outcome,
-                "resolvedOutcomeSource": "market" if resolved_outcome else None,
+                "resolvedOutcomeSource": (
+                    f"market-{token_meta.get('market_win_source') or 'unknown'}"
+                    if resolved_outcome
+                    else None
+                ),
                 "realizedPnl": realized_entry.get("cash_pnl") if realized_entry else None,
                 "claimAmount": realized_entry.get("claim_amount") if realized_entry else None,
                 "settlementPrice": realized_entry.get("settlement_price") if realized_entry else None,
