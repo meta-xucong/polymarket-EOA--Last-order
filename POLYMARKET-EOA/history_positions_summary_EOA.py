@@ -845,6 +845,35 @@ def _prompt_since_date() -> Tuple[str, float]:
     return date_text, since_ts
 
 
+def _print_claim_only_summary(
+    claim_only_assets: Set[str],
+    claim_only_meta: Dict[str, Dict[str, Any]],
+    realized_map: Dict[str, Dict[str, Any]],
+) -> None:
+    if not claim_only_assets:
+        return
+
+    claim_only_count = len(claim_only_assets)
+    claim_only_amount = 0.0
+    for asset in claim_only_assets:
+        entry = realized_map.get(asset) or {}
+        amt = entry.get("claim_amount")
+        if isinstance(amt, (int, float)):
+            claim_only_amount += float(amt)
+    print(
+        "\n[INFO] 仅发现 claim 记录、缺少买入/成交数据的市场：{} 个 | 领取总额≈{}".format(
+            claim_only_count, _vp_fmt_money(claim_only_amount)
+        )
+    )
+    for asset in sorted(claim_only_assets):
+        meta = claim_only_meta.get(asset) or {}
+        title = meta.get("market_title") or meta.get("market_slug") or asset
+        outcome = meta.get("token_label") or "-"
+        claim_amount = realized_map.get(asset, {}).get("claim_amount")
+        claim_text = _vp_fmt_money(claim_amount) if isinstance(claim_amount, (int, float)) else "-"
+        print(f" - {title} | {outcome} | token_id={asset} | claim≈{claim_text}")
+
+
 def _compose_position_rows(
     positions: Dict[str, BuyPosition],
     realized: Dict[str, Dict[str, Any]],
@@ -1130,6 +1159,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not rows:
         print("[INFO] 在指定区间内没有买入记录。")
+        _print_claim_only_summary(claim_only_assets, claim_only_meta, realized_map)
         return 0
 
     print("\n[HISTORY] 历史买入持仓（含结算盈亏）：")
@@ -1216,26 +1246,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     )
 
-    if claim_only_assets:
-        claim_only_count = len(claim_only_assets)
-        claim_only_amount = 0.0
-        for asset in claim_only_assets:
-            entry = realized_map.get(asset) or {}
-            amt = entry.get("claim_amount")
-            if isinstance(amt, (int, float)):
-                claim_only_amount += float(amt)
-        print(
-            "\n[INFO] 仅发现 claim 记录、缺少买入/成交数据的市场：{} 个 | 领取总额≈{}".format(
-                claim_only_count, _vp_fmt_money(claim_only_amount)
-            )
-        )
-        for asset in sorted(claim_only_assets):
-            meta = claim_only_meta.get(asset) or {}
-            title = meta.get("market_title") or meta.get("market_slug") or asset
-            outcome = meta.get("token_label") or "-"
-            claim_amount = realized_map.get(asset, {}).get("claim_amount")
-            claim_text = _vp_fmt_money(claim_amount) if isinstance(claim_amount, (int, float)) else "-"
-            print(f" - {title} | {outcome} | token_id={asset} | claim≈{claim_text}")
+    _print_claim_only_summary(claim_only_assets, claim_only_meta, realized_map)
 
     if unresolved_but_marked:
         print("\n[WARN] 以下市场被标记为已结算，但未能从 Gamma 数据推断赢家：")
