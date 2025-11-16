@@ -220,9 +220,16 @@ def _fetch_trades(user: str, limit: int = 500, max_pages: int = 5) -> List[Dict[
 
 
 def _fetch_activity_redeem(user: str, limit: int = 500, max_pages: int = 5) -> List[Dict[str, Any]]:
+    """拉取 /activity 全量，再在本地过滤 type=REDEEM，规避服务端过滤缺失。"""
+
     url = f"{DATA_API_HOST}/activity"
-    params = {"user": user, "type": "REDEEM"}
-    return _fetch_paginated(url, params, limit, max_pages)
+    params = {"user": user}
+    raw_entries = _fetch_paginated(url, params, limit, max_pages)
+    redeem_entries = [e for e in raw_entries if str(e.get("type", "")).upper() == "REDEEM"]
+    _debug_print(
+        f"/activity raw_total={len(raw_entries)} | redeem_total={len(redeem_entries)}"
+    )
+    return redeem_entries
 
 
 def _build_trade_event(entry: Dict[str, Any]) -> Optional[Event]:
@@ -267,10 +274,24 @@ def _build_trade_event(entry: Dict[str, Any]) -> Optional[Event]:
 
 
 def _build_redeem_event(entry: Dict[str, Any]) -> Optional[Event]:
-    asset = _first_present(entry, ("asset", "tokenId", "token_id", "tokenID"))
-    if not asset:
-        return None
+    """构造 REDEEM 事件，允许 asset 为空并用 conditionId/outcome 兜底聚合。"""
+
+    raw_asset = _first_present(entry, ("asset", "tokenId", "token_id", "tokenID"))
     condition_id = _first_present(entry, ("conditionId", "condition_id"))
+    outcome = str(entry.get("outcome") or entry.get("outcomeLabel") or "").strip()
+    title = str(entry.get("title") or "").strip()
+    slug = str(entry.get("slug") or entry.get("eventSlug") or "").strip()
+
+    # 允许 asset 为空，退而求其次使用 conditionId + outcome 作为聚合 key；再不行用 tx 兜底。
+    if raw_asset and str(raw_asset).strip():
+        asset = str(raw_asset).strip()
+    elif condition_id:
+        label = outcome or "REDEEM"
+        asset = f"{condition_id}#{label}"
+    else:
+        tx_hash = entry.get("transactionHash") or "unknown_tx"
+        asset = f"REDEEM_ONLY#{tx_hash}"
+
     outcome_index = None
     oi_raw = _first_present(entry, ("outcomeIndex", "outcome_index"))
     if oi_raw is not None:
@@ -278,9 +299,7 @@ def _build_redeem_event(entry: Dict[str, Any]) -> Optional[Event]:
             outcome_index = int(float(oi_raw))
         except Exception:
             outcome_index = None
-    outcome = str(entry.get("outcome") or entry.get("outcomeLabel") or "").strip()
-    title = str(entry.get("title") or "").strip()
-    slug = str(entry.get("slug") or entry.get("eventSlug") or "").strip()
+
     size = _safe_float(entry.get("size"))
     usdc_size = _optional_float(entry.get("usdcSize"))
     cash = _safe_float(usdc_size, 0.0)
@@ -288,7 +307,7 @@ def _build_redeem_event(entry: Dict[str, Any]) -> Optional[Event]:
     if ts is None:
         return None
     return Event(
-        asset=str(asset),
+        asset=asset,
         condition_id=str(condition_id) if condition_id else None,
         outcome_index=outcome_index,
         outcome=outcome,
