@@ -10,7 +10,11 @@
 
 使用示例：
     python3 history_claims_summary_EOA.py
-    python3 history_claims_summary_EOA.py --filter-by trade --json
+    python3 history_claims_summary_EOA.py --json  # 输出到标准输出
+    python3 history_claims_summary_EOA.py --json claims.json --since "2024-10-01"
+
+快捷参数：
+- 支持 `--since` / `--since-date`，并兼容误写成 `--since2024-10-01` 的场景。
 """
 
 from __future__ import annotations
@@ -19,11 +23,13 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
+
+from key_utils import make_key
 
 try:  # 复用 view_positions_EOA 内的钱包检测与格式化
     from view_positions_EOA import (  # type: ignore
@@ -50,6 +56,7 @@ DEBUG_LOG = False
 
 @dataclass
 class Event:
+    key: str
     asset: str
     condition_id: Optional[str]
     outcome_index: Optional[int]
@@ -62,6 +69,7 @@ class Event:
     usdc_size: Optional[float]
     cash: float
     timestamp: float
+    tx_hash: str = ""
 
 
 def _debug_print(message: str) -> None:
@@ -257,7 +265,10 @@ def _build_trade_event(entry: Dict[str, Any]) -> Optional[Event]:
     ts = _entry_timestamp(entry)
     if ts is None:
         return None
+    key = make_key(condition_id, outcome_index, outcome or side)
+    tx_hash = str(entry.get("transactionHash") or "").strip()
     return Event(
+        key=key,
         asset=str(asset),
         condition_id=str(condition_id) if condition_id else None,
         outcome_index=outcome_index,
@@ -270,6 +281,7 @@ def _build_trade_event(entry: Dict[str, Any]) -> Optional[Event]:
         usdc_size=None,
         cash=cash,
         timestamp=ts,
+        tx_hash=tx_hash,
     )
 
 
@@ -282,15 +294,8 @@ def _build_redeem_event(entry: Dict[str, Any]) -> Optional[Event]:
     title = str(entry.get("title") or "").strip()
     slug = str(entry.get("slug") or entry.get("eventSlug") or "").strip()
 
-    # 允许 asset 为空，退而求其次使用 conditionId + outcome 作为聚合 key；再不行用 tx 兜底。
-    if raw_asset and str(raw_asset).strip():
-        asset = str(raw_asset).strip()
-    elif condition_id:
-        label = outcome or "REDEEM"
-        asset = f"{condition_id}#{label}"
-    else:
-        tx_hash = entry.get("transactionHash") or "unknown_tx"
-        asset = f"REDEEM_ONLY#{tx_hash}"
+    # 允许 asset 为空，聚合使用 conditionId/outcome 生成的 key；asset 仅作为补充信息。
+    asset = str(raw_asset).strip() if raw_asset else ""
 
     outcome_index = None
     oi_raw = _first_present(entry, ("outcomeIndex", "outcome_index"))
@@ -300,13 +305,16 @@ def _build_redeem_event(entry: Dict[str, Any]) -> Optional[Event]:
         except Exception:
             outcome_index = None
 
+    key = make_key(condition_id, outcome_index, outcome)
     size = _safe_float(entry.get("size"))
     usdc_size = _optional_float(entry.get("usdcSize"))
     cash = _safe_float(usdc_size, 0.0)
     ts = _entry_timestamp(entry)
     if ts is None:
         return None
+    tx_hash = str(entry.get("transactionHash") or "").strip()
     return Event(
+        key=key,
         asset=asset,
         condition_id=str(condition_id) if condition_id else None,
         outcome_index=outcome_index,
@@ -319,6 +327,7 @@ def _build_redeem_event(entry: Dict[str, Any]) -> Optional[Event]:
         usdc_size=usdc_size,
         cash=cash,
         timestamp=ts,
+        tx_hash=tx_hash,
     )
 
 
@@ -358,6 +367,7 @@ def _collect_events(trades: List[Dict[str, Any]], redeem_entries: List[Dict[str,
 
 @dataclass
 class PositionSummary:
+    key: str
     asset: str
     condition_id: Optional[str]
     outcome_index: Optional[int]
@@ -373,12 +383,15 @@ class PositionSummary:
     cash_flow_total: float = 0.0
     first_ts: Optional[float] = None
     last_ts: Optional[float] = None
+    token_ids: List[str] = field(default_factory=list)
 
     @property
     def avg_buy_price(self) -> float:
         return (self.buy_cost_total / self.buy_size_total) if self.buy_size_total > 0 else 0.0
 
     def apply_event(self, event: Event) -> None:
+        if event.asset and event.asset not in self.token_ids:
+            self.token_ids.append(event.asset)
         self.title = self.title or event.title
         self.outcome = self.outcome or event.outcome
         self.slug = self.slug or event.slug
@@ -401,9 +414,10 @@ class PositionSummary:
 def _aggregate_positions(events: List[Event]) -> Dict[str, PositionSummary]:
     bucket: Dict[str, PositionSummary] = {}
     for evt in events:
-        pos = bucket.get(evt.asset)
+        pos = bucket.get(evt.key)
         if not pos:
             pos = PositionSummary(
+                key=evt.key,
                 asset=evt.asset,
                 condition_id=evt.condition_id,
                 outcome_index=evt.outcome_index,
@@ -411,7 +425,7 @@ def _aggregate_positions(events: List[Event]) -> Dict[str, PositionSummary]:
                 outcome=evt.outcome,
                 slug=evt.slug,
             )
-            bucket[evt.asset] = pos
+            bucket[evt.key] = pos
         pos.apply_event(evt)
     return bucket
 
@@ -419,11 +433,29 @@ def _aggregate_positions(events: List[Event]) -> Dict[str, PositionSummary]:
 def _filter_events_by_mode(events: List[Event], since_ts: float, mode: str) -> Tuple[List[Event], List[Event]]:
     redeem_events_since = [e for e in events if e.type == "REDEEM" and e.timestamp >= since_ts]
     if mode == "redeem":
-        scope_assets = {e.asset for e in redeem_events_since}
-        scoped_events = [e for e in events if e.asset in scope_assets]
+        scope_keys = {e.key for e in redeem_events_since}
+        scoped_events = [e for e in events if e.key in scope_keys]
     else:  # trade 口径，直接按时间过滤所有事件
         scoped_events = [e for e in events if e.timestamp >= since_ts]
     return redeem_events_since, scoped_events
+
+
+def _normalize_cli_args(argv: List[str]) -> List[str]:
+    """修正常见误写，如 `--since2024-10-01`、`--since-date2024-10-01`。"""
+
+    normalized: List[str] = []
+    for arg in argv:
+        if arg.startswith("--since="):
+            normalized.append(arg)
+        elif arg.startswith("--since-date="):
+            normalized.append(arg)
+        elif arg.startswith("--since") and arg not in ("--since", "--since-date"):
+            normalized.extend(["--since", arg[len("--since") :]])
+        elif arg.startswith("--since-date") and arg != "--since-date":
+            normalized.extend(["--since-date", arg[len("--since-date") :]])
+        else:
+            normalized.append(arg)
+    return normalized
 
 
 def _print_claim_events(events: List[Event]) -> None:
@@ -436,14 +468,23 @@ def _print_claim_events(events: List[Event]) -> None:
     for idx, evt in enumerate(events_sorted, 1):
         ts_text = _fmt_timestamp_local(evt.timestamp)
         print(
-            f"{idx:>3}. {evt.title or '-'} | {evt.outcome or '-'} | token_id={evt.asset}"
+            f"{idx:>3}. {evt.title or '-'} | {evt.outcome or '-'} | key={evt.key}"
         )
         print(
             "     "
             f"赎回份数={evt.size:.4f} | 赎回金额≈{_vp_fmt_money(evt.usdc_size or 0.0)} | 时间={ts_text}"
         )
+        extras = []
+        if evt.asset:
+            extras.append(f"token_id={evt.asset}")
         if evt.slug:
-            print(f"     slug={evt.slug}")
+            extras.append(f"slug={evt.slug}")
+        if evt.tx_hash:
+            extras.append(f"tx={evt.tx_hash}")
+        if evt.key.startswith("UNKNOWN#"):
+            extras.append("[NOTE] outcome 缺失，按 market 级别粗聚合")
+        if extras:
+            print(f"     {' | '.join(extras)}")
     print(f"\n[CLAIMS] 统计：共 {len(events_sorted)} 笔，赎回总额≈{_vp_fmt_money(total_usdc)} USDC")
 
 
@@ -451,11 +492,11 @@ def _print_positions(positions: Dict[str, PositionSummary]) -> None:
     if not positions:
         print("[INFO] 没有需要展示的仓位汇总。")
         return
-    print("\n[POSITIONS] 按 token 汇总：")
+    print("\n[POSITIONS] 按 key 汇总：")
     total_cash = 0.0
-    for idx, (asset, pos) in enumerate(sorted(positions.items(), key=lambda kv: kv[1].last_ts or 0, reverse=True), 1):
+    for idx, (key, pos) in enumerate(sorted(positions.items(), key=lambda kv: kv[1].last_ts or 0, reverse=True), 1):
         total_cash += pos.cash_flow_total
-        print(f"{idx:>3}. {pos.title or '-'} | {pos.outcome or '-'} | token_id={asset}")
+        print(f"{idx:>3}. {pos.title or '-'} | {pos.outcome or '-'} | key={key}")
         print(
             "     "
             f"买入总量={pos.buy_size_total:.4f} | 买入均价≈{_vp_fmt_money(pos.avg_buy_price)} | 买入成本≈{_vp_fmt_money(pos.buy_cost_total)}"
@@ -472,13 +513,28 @@ def _print_positions(positions: Dict[str, PositionSummary]) -> None:
             "     "
             f"现金流合计≈{_vp_fmt_money(pos.cash_flow_total)} | 时间区间：{_fmt_timestamp_local(pos.first_ts)} -> {_fmt_timestamp_local(pos.last_ts)}"
         )
+        extras = []
+        if pos.token_ids:
+            extras.append(f"token_ids={','.join(pos.token_ids)}")
+        if pos.slug:
+            extras.append(f"slug={pos.slug}")
+        if pos.key.startswith("UNKNOWN#"):
+            extras.append("[NOTE] outcome 缺失，按 market 级别粗聚合")
+        if extras:
+            print(f"     {' | '.join(extras)}")
         print()
     print(f"[POSITIONS] 现金流汇总：≈{_vp_fmt_money(total_cash)} USDC")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Polymarket Claim 统计工具（现金流口径）")
-    parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+    parser.add_argument(
+        "--json",
+        nargs="?",
+        const="-",
+        dest="json_out",
+        help="以 JSON 输出结果；可选路径，默认输出到标准输出",
+    )
     parser.add_argument("--debug", action="store_true", help="输出调试日志")
     parser.add_argument(
         "--filter-by",
@@ -486,12 +542,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="redeem",
         help="统计入口：redeem=按赎回时间筛选 token（默认），trade=按事件时间直接过滤",
     )
-    parser.add_argument("--since-date", dest="since_date", help="筛选起始日期，格式 YYYY-MM-DD，默认交互式输入")
+    parser.add_argument(
+        "--since",
+        dest="since_date",
+        help="筛选起始日期，格式 YYYY-MM-DD，默认交互式输入（同 --since-date）",
+    )
+    parser.add_argument(
+        "--since-date", dest="since_date", help="筛选起始日期，格式 YYYY-MM-DD，默认交互式输入"
+    )
     parser.add_argument("--trades-limit", type=int, default=500, help="/trades 每页条数")
     parser.add_argument("--trades-pages", type=int, default=5, help="/trades 最大翻页数")
     parser.add_argument("--activity-limit", type=int, default=500, help="/activity 每页条数")
     parser.add_argument("--activity-pages", type=int, default=5, help="/activity 最大翻页数")
-    args = parser.parse_args(argv)
+    parsed_argv = _normalize_cli_args(argv or sys.argv[1:])
+    args = parser.parse_args(parsed_argv)
 
     global DEBUG_LOG
     DEBUG_LOG = bool(args.debug)
@@ -531,7 +595,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     positions = _aggregate_positions(scoped_events)
 
-    if args.json:
+    if args.json_out is not None:
         output = {
             "wallet": user,
             "since_date_utc8": since_date_text,
@@ -539,7 +603,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             "claim_events": [evt.__dict__ for evt in redeem_events_since],
             "positions": {k: v.__dict__ for k, v in positions.items()},
         }
-        print(json.dumps(output, ensure_ascii=False, indent=2))
+        serialized = json.dumps(output, ensure_ascii=False, indent=2)
+        json_path = args.json_out
+        if not json_path or json_path == "-":
+            print(serialized)
+        else:
+            with open(json_path, "w", encoding="utf-8") as f:
+                f.write(serialized)
+            print(f"[OK] JSON 已保存：{json_path}")
         return 0
 
     _print_claim_events(redeem_events_since)
