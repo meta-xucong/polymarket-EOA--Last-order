@@ -59,6 +59,8 @@ DATA_API_HOST = os.environ.get("DATA_API_HOST", _VP_DATA_API_HOST).rstrip("/")
 GAMMA_API_HOST = os.environ.get("GAMMA_API_HOST", "https://gamma-api.polymarket.com").rstrip("/")
 GAMMA_ALT_HOST = os.environ.get("GAMMA_ALT_HOST", "https://gamma.polymarket.com").rstrip("/")
 MARKET_LOOKUP_HOSTS = [host for host in (GAMMA_API_HOST, GAMMA_ALT_HOST) if host]
+DISABLE_MARKET_CACHE = bool(os.environ.get("DISABLE_MARKET_CACHE"))
+DEBUG_LOG = False
 
 DEFAULT_SINCE_DATE = "2025-11-13"
 UTC_PLUS_8 = timezone(timedelta(hours=8))
@@ -184,13 +186,22 @@ def _extract_outcome_names(raw: Dict[str, Any]) -> List[str]:
 _MARKET_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 
 
+def _debug_print(message: str) -> None:
+    if DEBUG_LOG:
+        print(f"[DEBUG] {message}")
+
+
 def _fetch_market_by_token(token_id: str) -> Optional[Dict[str, Any]]:
     token_id = str(token_id or "").strip()
     if not token_id:
         return None
-    cached = _MARKET_CACHE.get(token_id)
-    if cached is not None:
-        return cached
+    if not DISABLE_MARKET_CACHE:
+        cached = _MARKET_CACHE.get(token_id)
+        if cached is not None:
+            _debug_print(f"market cache hit for token_id={token_id}")
+            return cached
+    else:
+        _debug_print(f"market cache bypassed for token_id={token_id}")
     for host in MARKET_LOOKUP_HOSTS:
         if not host:
             continue
@@ -207,9 +218,14 @@ def _fetch_market_by_token(token_id: str) -> Optional[Dict[str, Any]]:
         if not items:
             continue
         market = items[0]
-        _MARKET_CACHE[token_id] = market
+        if not DISABLE_MARKET_CACHE:
+            _MARKET_CACHE[token_id] = market
+        _debug_print(
+            f"market fetched for token_id={token_id} from host={host} | title={market.get('title') or market.get('question') or market.get('name')}"
+        )
         return market
-    _MARKET_CACHE[token_id] = None
+    if not DISABLE_MARKET_CACHE:
+        _MARKET_CACHE[token_id] = None
     return None
 
 
@@ -447,6 +463,32 @@ def _paginate_offset(
             break
         offset += limit
     return out
+
+
+def _log_history_stats(tag: str, entries: List[Dict[str, Any]]) -> None:
+    if not DEBUG_LOG:
+        return
+
+    ts_values: List[float] = []
+    claim_like = 0
+    resolved_like = 0
+    for entry in entries:
+        ts = _entry_timestamp(entry)
+        if ts is not None:
+            ts_values.append(ts)
+        if entry.get("claimAmount") or entry.get("claimed") or entry.get("wasClaimed"):
+            claim_like += 1
+        status_text = str(entry.get("status") or entry.get("type") or entry.get("action") or "").lower()
+        if status_text in ("claim", "claimed", "resolve", "resolved", "settled", "closed"):
+            resolved_like += 1
+
+    latest_ts = max(ts_values) if ts_values else None
+    earliest_ts = min(ts_values) if ts_values else None
+    latest_text = _fmt_timestamp_local(latest_ts) if latest_ts is not None else "-"
+    earliest_text = _fmt_timestamp_local(earliest_ts) if earliest_ts is not None else "-"
+    _debug_print(
+        f"{tag}: total={len(entries)} | with_ts={len(ts_values)} | earliest={earliest_text} | latest={latest_text} | claim_like={claim_like} | resolved_like={resolved_like}"
+    )
 
 
 def _trade_history_endpoints() -> List[str]:
@@ -864,6 +906,12 @@ def _compose_position_rows(
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Polymarket 历史仓位统计工具")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+    parser.add_argument("--debug", action="store_true", help="输出调试日志，包含接口回包统计")
+    parser.add_argument(
+        "--no-market-cache",
+        action="store_true",
+        help="跳过市场元数据缓存，强制每次请求最新市场信息",
+    )
     parser.add_argument(
         "--trades-limit",
         "--fills-limit",
@@ -894,6 +942,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    global DEBUG_LOG, DISABLE_MARKET_CACHE
+    DEBUG_LOG = bool(args.debug)
+    if args.no_market_cache:
+        DISABLE_MARKET_CACHE = True
+        _MARKET_CACHE.clear()
+        _debug_print("market cache disabled by CLI flag")
+
     # Fetch user address
     user = _vp_infer_wallet_address()
     if not user:
@@ -914,6 +969,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as exc:
         print(f"[ERR] 获取历史成交失败：{exc}", file=sys.stderr)
         return 4
+    _debug_print(f"/trades 返回 {len(trades)} 条记录（含 BUY/SELL）")
 
     history_entries: List[Dict[str, Any]] = []
     try:
@@ -927,6 +983,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as exc:
         print(f"[WARN] 获取历史仓位 /activity 失败：{exc}")
 
+    _log_history_stats("/activity", history_entries)
+
     try:
         history_entries.extend(
             _fetch_closed_positions(
@@ -938,8 +996,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as exc:
         print(f"[WARN] 获取 /closed-positions 失败：{exc}")
 
+    _log_history_stats("/closed-positions", history_entries)
+
     filtered_trades = _filter_entries_since(trades, since_ts)
     filtered_history = _filter_entries_since(history_entries, since_ts)
+
+    _debug_print(
+        f"过滤时间 {since_date_text} 后：trades={len(filtered_trades)} | history={len(filtered_history)}"
+    )
 
     buy_positions = _summarize_buy_trades(filtered_trades)
     realized_map = _summarize_activity(filtered_history)
