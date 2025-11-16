@@ -219,6 +219,26 @@ def _print_merged(rows: List[Dict[str, Any]]) -> None:
         print()
 
 
+def _print_summary(rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+
+    total_entries = len(rows)
+    total_invest = sum(float(r.get("buy_cost_total") or 0.0) for r in rows)
+    total_profit = sum(float(r.get("net_cash_flow") or 0.0) for r in rows)
+    success_count = sum(1 for r in rows if float(r.get("net_cash_flow") or 0.0) >= 0)
+    failure_count = total_entries - success_count
+    roi = (total_profit / total_invest * 100) if total_invest > 0 else 0.0
+
+    print("[SUMMARY] 统计概览：")
+    print(f"总条目={total_entries} | 命中={success_count} | 失利={failure_count}")
+    print(
+        "总投入≈{:.2f} | 总收益≈{:.2f} | 总收益率≈{:.2f}%".format(
+            total_invest, total_profit, roi
+        )
+    )
+
+
 def _export_json(rows: List[Dict[str, Any]], path: str) -> None:
     payload = {"merged": rows}
     with open(path, "w", encoding="utf-8") as f:
@@ -311,6 +331,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     merged_rows = _merge_positions_and_claims(positions_payload, claims_payload)
     _print_merged(merged_rows)
+    _print_summary(merged_rows)
 
     if args.json_out:
         _export_json(merged_rows, args.json_out)
