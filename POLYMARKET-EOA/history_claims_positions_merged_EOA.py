@@ -60,7 +60,7 @@ def _load_json(path: str, flag: str) -> Dict[str, Any]:
             "请先运行：\n"
             "  python3 history_positions_summary_EOA.py --json positions.json\n"
             "  python3 history_claims_summary_EOA.py --json claims.json [--since YYYY-MM-DD]\n"
-            "并用 --{} 指向生成的文件。".format(cli_flag)
+            "并用 --{} 指向生成的文件。".format(path, cli_flag)
         )
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
