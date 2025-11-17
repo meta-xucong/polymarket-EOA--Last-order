@@ -744,16 +744,37 @@ def _collect_fallback_buy_costs(
         source: str,
         ts: Optional[float] = None,
         extra: Optional[Dict[str, Any]] = None,
+        total_cost: Any = None,
     ) -> None:
         if not asset:
             return
+
         size_val = _optional_float(size)
         price_val = _optional_float(price)
-        if price_val is None or price_val <= 0:
+        cost_val = _optional_float(total_cost)
+
+        # 如果缺少 size，但提供了价格 + 成本，则尝试推算 size
+        if (size_val is None or size_val <= 0) and price_val and cost_val and price_val > 0:
+            try:
+                size_val = cost_val / price_val
+            except Exception:
+                size_val = None
+
+        if cost_val is None or cost_val <= 0:
+            if price_val and price_val > 0 and size_val and size_val > 0:
+                cost_val = size_val * price_val
+            elif price_val and price_val > 0 and size_val:
+                cost_val = price_val
+
+        if not (size_val and size_val > 0 and cost_val and cost_val > 0):
             return
-        total_cost = None
-        if isinstance(size_val, (int, float)) and size_val > 0:
-            total_cost = size_val * price_val
+
+        if price_val is None or price_val <= 0:
+            try:
+                price_val = cost_val / size_val
+            except Exception:
+                price_val = None
+
         prev = fallback.get(asset)
         # 如果已有记录且拥有成本值，则优先保留已有的；否则回填新的
         if prev and isinstance(prev.get("total_cost"), (int, float)) and prev.get("total_cost") > 0:
@@ -761,7 +782,7 @@ def _collect_fallback_buy_costs(
         fallback[asset] = {
             "size": size_val,
             "price": price_val,
-            "total_cost": total_cost,
+            "total_cost": cost_val,
             "source": source,
             "timestamp": ts,
         }
@@ -778,11 +799,21 @@ def _collect_fallback_buy_costs(
         "executionPrice",
         "tradePrice",
     )
+    cost_keys = (
+        "totalCost",
+        "total_cost",
+        "cost",
+        "buyCost",
+        "cashSpent",
+        "cash_spent",
+        "amountPaid",
+    )
     size_keys = ("size", "quantity", "tokens", "position", "shares")
 
     for entry in history_entries:
         asset = _extract_asset_id(entry)
         price = _first_present(entry, buy_price_keys)
+        total_cost = _first_present(entry, cost_keys)
         size = _first_present(entry, size_keys)
         _record(
             asset,
@@ -790,6 +821,7 @@ def _collect_fallback_buy_costs(
             price,
             "history",
             _entry_timestamp(entry),
+            total_cost=total_cost,
             extra={
                 "title": entry.get("title")
                 or entry.get("market")
@@ -811,12 +843,14 @@ def _collect_fallback_buy_costs(
             asset = _extract_asset_id(pos)
             size = _first_present(pos, size_keys)
             price = _first_present(pos, ("avgPrice", "averagePrice", "entryPrice", "price"))
+            total_cost = _first_present(pos, cost_keys)
             _record(
                 asset,
                 size,
                 price,
                 "positions",
                 _entry_timestamp(pos),
+                total_cost=total_cost,
                 extra={
                     "title": pos.get("title")
                     or pos.get("market")
