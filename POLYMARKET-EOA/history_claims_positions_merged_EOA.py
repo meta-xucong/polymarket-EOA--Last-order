@@ -419,43 +419,32 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
 
-    def _is_claim_only(row: Dict[str, Any]) -> bool:
-        if row.get("has_position_info"):
-            return False
-        buy_cost = float(row.get("buy_cost_total") or 0.0)
-        sell_proceeds = float(row.get("sell_proceeds_total") or 0.0)
-        buy_size = float(row.get("buy_size_total") or 0.0)
-        sell_size = float(row.get("sell_size_total") or 0.0)
-        return (
-            buy_cost == 0.0
-            and sell_proceeds == 0.0
-            and buy_size == 0.0
-            and sell_size == 0.0
-        )
-
     settled_rows = [r for r in rows if r.get("has_claim")]
 
-    # 主统计：已结算 + 有仓位 + 有成本，格式对齐旧版
+    # 主统计：已结算 + 有成本
     main_rows = [
-        r
-        for r in settled_rows
-        if r.get("has_position_info")
-        and not _is_claim_only(r)
-        and float(r.get("buy_cost_total") or 0.0) > 0.0
+        r for r in settled_rows if float(r.get("buy_cost_total") or 0.0) > 0.0
     ]
 
     total_entries = len(main_rows)
     total_invest = sum(float(r.get("buy_cost_total") or 0.0) for r in main_rows)
-    total_profit = sum(float(r.get("net_cash_flow") or 0.0) for r in main_rows)
-    success_count = sum(1 for r in main_rows if float(r.get("net_cash_flow") or 0.0) >= 0)
+    total_claim = sum(float(r.get("redeem_usdc_total") or 0.0) for r in main_rows)
+    total_profit = total_claim - total_invest
+    success_count = sum(
+        1
+        for r in main_rows
+        if float(r.get("redeem_usdc_total") or 0.0)
+        - float(r.get("buy_cost_total") or 0.0)
+        >= 0
+    )
     failure_count = len(main_rows) - success_count
     roi = (total_profit / total_invest * 100) if total_invest > 0 else 0.0
 
     print("[SUMMARY] 统计概览：")
     print(f"总条目={total_entries} | 命中={success_count} | 失利={failure_count}")
     print(
-        "总投入≈{:.2f} | 总收益≈{:.2f} | 总收益率≈{:.2f}%".format(
-            total_invest, total_profit, roi
+        "总投入≈{:.2f} | 总CLAIM≈{:.2f} | 总收益≈{:.2f} | 总收益率≈{:.2f}%".format(
+            total_invest, total_claim, total_profit, roi
         )
     )
 
@@ -471,25 +460,19 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
         pending_invest = sum(
             float(r.get("buy_cost_total") or 0.0) for r in pending_rows
         )
-        pending_cash_flow = sum(
-            float(r.get("net_cash_flow") or 0.0) for r in pending_rows
-        )
-        pending_roi = (
-            pending_cash_flow / pending_invest * 100 if pending_invest > 0 else 0.0
-        )
         print("[PENDING] 未结算概览：")
-        print(
-            f"总条目={len(pending_rows)} | 总投入≈{pending_invest:.2f} | 当前净现金流≈{pending_cash_flow:.2f} | 当前收益率≈{pending_roi:.2f}%"
-        )
+        print(f"总条目={len(pending_rows)} | 总投入≈{pending_invest:.2f}")
 
-    # 仅 claim 或缺失成本的条目单独汇总 claim 总额
-    missing_rows = [r for r in settled_rows if r not in main_rows]
+    # 已 claim 但仍缺买入成本的条目单列
+    missing_rows = [
+        r for r in settled_rows if float(r.get("buy_cost_total") or 0.0) <= 0.0
+    ]
     if missing_rows:
         missing_claim_total = sum(
             float(r.get("redeem_usdc_total") or 0.0) for r in missing_rows
         )
         print(
-            f"[MISSING] 仅 claim / 缺失成本条目：{len(missing_rows)} 个，claim 总额≈{missing_claim_total:.2f}"
+            f"[MISSING] 已 claim 但缺买入成本：{len(missing_rows)} 个，claim 总额≈{missing_claim_total:.2f}"
         )
 
 
