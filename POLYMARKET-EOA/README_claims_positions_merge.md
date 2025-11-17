@@ -33,7 +33,7 @@
   - `--since YYYY-MM-DD`：按 UTC+8 起始日期过滤成交。
   - `--json [path]`：以 JSON 输出；缺省路径时输出到标准输出，指定路径会写入文件。
 - `history_claims_summary_EOA.py`
-  - `--since YYYY-MM-DD`：按 UTC+8 起始日期筛选 claim 事件。
+  - `--since YYYY-MM-DD`（或 `--since-date`）：按 UTC+8 起始日期筛选 claim 事件，支持误写成 `--since2024-10-01`。
   - `--filter-by redeem|trade|all`：默认 `redeem`，如需调试成交数据可选 `trade`。
   - `--json [path]`：以 JSON 输出；缺省路径时输出到标准输出，指定路径会写入文件。
 - `history_claims_positions_merged_EOA.py`

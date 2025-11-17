@@ -12,6 +12,9 @@
     python3 history_claims_summary_EOA.py
     python3 history_claims_summary_EOA.py --json  # 输出到标准输出
     python3 history_claims_summary_EOA.py --json claims.json --since "2024-10-01"
+
+快捷参数：
+- 支持 `--since` / `--since-date`，并兼容误写成 `--since2024-10-01` 的场景。
 """
 
 from __future__ import annotations
@@ -437,6 +440,24 @@ def _filter_events_by_mode(events: List[Event], since_ts: float, mode: str) -> T
     return redeem_events_since, scoped_events
 
 
+def _normalize_cli_args(argv: List[str]) -> List[str]:
+    """修正常见误写，如 `--since2024-10-01`、`--since-date2024-10-01`。"""
+
+    normalized: List[str] = []
+    for arg in argv:
+        if arg.startswith("--since="):
+            normalized.append(arg)
+        elif arg.startswith("--since-date="):
+            normalized.append(arg)
+        elif arg.startswith("--since") and arg not in ("--since", "--since-date"):
+            normalized.extend(["--since", arg[len("--since") :]])
+        elif arg.startswith("--since-date") and arg != "--since-date":
+            normalized.extend(["--since-date", arg[len("--since-date") :]])
+        else:
+            normalized.append(arg)
+    return normalized
+
+
 def _print_claim_events(events: List[Event]) -> None:
     if not events:
         print("[INFO] 在指定时间后没有新的 claim 事件。")
@@ -521,12 +542,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="redeem",
         help="统计入口：redeem=按赎回时间筛选 token（默认），trade=按事件时间直接过滤",
     )
-    parser.add_argument("--since-date", dest="since_date", help="筛选起始日期，格式 YYYY-MM-DD，默认交互式输入")
+    parser.add_argument(
+        "--since",
+        dest="since_date",
+        help="筛选起始日期，格式 YYYY-MM-DD，默认交互式输入（同 --since-date）",
+    )
+    parser.add_argument(
+        "--since-date", dest="since_date", help="筛选起始日期，格式 YYYY-MM-DD，默认交互式输入"
+    )
     parser.add_argument("--trades-limit", type=int, default=500, help="/trades 每页条数")
     parser.add_argument("--trades-pages", type=int, default=5, help="/trades 最大翻页数")
     parser.add_argument("--activity-limit", type=int, default=500, help="/activity 每页条数")
     parser.add_argument("--activity-pages", type=int, default=5, help="/activity 最大翻页数")
-    args = parser.parse_args(argv)
+    parsed_argv = _normalize_cli_args(argv or sys.argv[1:])
+    args = parser.parse_args(parsed_argv)
 
     global DEBUG_LOG
     DEBUG_LOG = bool(args.debug)
