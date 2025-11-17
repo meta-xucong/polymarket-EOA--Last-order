@@ -420,7 +420,7 @@ BLACKLIST_TERMS = [
     "Esports","CS2","Cup","Arsenal","Liverpool","Chelsea",
     "EPL","PGA","Tour Championship","Scottie Scheffler",
     "Vitality","MOUZ","Falcons","The MongolZ","AL","Houston","Chicago","New York",
-    "Will Elon Musk post","dota2",
+    "Will Elon Musk post","dota2","a dozen eggs",
 ]
 
 def _build_blacklist_patterns(terms: Iterable[str]) -> List[Tuple[str, re.Pattern[str]]]:
