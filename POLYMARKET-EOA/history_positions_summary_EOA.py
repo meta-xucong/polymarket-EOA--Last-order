@@ -619,6 +619,7 @@ class BuyPosition:
     total_cost: float = 0.0
     first_ts: Optional[float] = None
     last_ts: Optional[float] = None
+    recovered_cost_source: Optional[str] = None
 
     def register_trade(self, trade: Dict[str, Any], size: float, price: float, ts: Optional[float]) -> None:
         if size <= 0:
@@ -713,7 +714,9 @@ def _collect_fallback_buy_costs(
 
     fallback: Dict[str, Dict[str, Any]] = {}
 
-    def _record(asset: str, size: Any, price: Any, source: str) -> None:
+    def _record(
+        asset: str, size: Any, price: Any, source: str, ts: Optional[float] = None
+    ) -> None:
         if not asset:
             return
         size_val = _optional_float(size)
@@ -732,6 +735,7 @@ def _collect_fallback_buy_costs(
             "price": price_val,
             "total_cost": total_cost,
             "source": source,
+            "timestamp": ts,
         }
 
     buy_price_keys = (
@@ -750,7 +754,7 @@ def _collect_fallback_buy_costs(
         asset = _extract_asset_id(entry)
         price = _first_present(entry, buy_price_keys)
         size = _first_present(entry, size_keys)
-        _record(asset, size, price, "history")
+        _record(asset, size, price, "history", _entry_timestamp(entry))
 
     if current_positions:
         for pos in current_positions:
@@ -760,6 +764,35 @@ def _collect_fallback_buy_costs(
             _record(asset, size, price, "positions")
 
     return fallback
+
+
+def _apply_fallback_positions(
+    buy_positions: Dict[str, BuyPosition], fallback_costs: Dict[str, Dict[str, Any]]
+) -> None:
+    """将 legacy 渠道的成本信息用于补建缺失的 BuyPosition。"""
+
+    for asset, fb in fallback_costs.items():
+        if asset in buy_positions:
+            continue
+        size = _optional_float(fb.get("size"))
+        price = _optional_float(fb.get("price"))
+        total_cost = _optional_float(fb.get("total_cost"))
+        if not (isinstance(size, (int, float)) and size > 0):
+            continue
+        if total_cost is None or total_cost <= 0:
+            if isinstance(price, (int, float)) and price > 0:
+                total_cost = size * price
+        if total_cost is None or total_cost <= 0:
+            continue
+        bp = BuyPosition(asset=asset)
+        bp.total_size = size
+        bp.total_cost = total_cost
+        ts = _optional_float(fb.get("timestamp"))
+        if ts is not None:
+            bp.first_ts = ts
+            bp.last_ts = ts
+        bp.recovered_cost_source = fb.get("source") or "legacy"
+        buy_positions[asset] = bp
 
 
 def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -973,6 +1006,10 @@ def _compose_position_rows(
         avg_price = bucket.avg_price
         fallback_used = False
         fallback_source = None
+
+        if bucket.recovered_cost_source:
+            fallback_used = True
+            fallback_source = bucket.recovered_cost_source
 
         if (total_cost <= 0 or total_size <= 0) and asset in fallback_costs:
             fb = fallback_costs.get(asset) or {}
@@ -1223,7 +1260,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if DEBUG_LOG:
             _debug_print(f"获取当前持仓用于回补成本失败：{exc}")
 
-    fallback_costs = _collect_fallback_buy_costs(filtered_history, current_positions)
+    fallback_costs = _collect_fallback_buy_costs(history_entries, current_positions)
+    _apply_fallback_positions(buy_positions, fallback_costs)
 
     claim_only_assets = {
         asset
@@ -1317,7 +1355,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             option_desc = f"{option_desc} [{token_side}]"
         markers: List[str] = []
         if row.get("buyCostRecovered"):
-            markers.append("成本回补")
+            source_text = row.get("buyCostSource") or "legacy"
+            markers.append(f"成本回补({source_text})")
         if row.get("missingCost"):
             markers.append("缺成本，未计入统计")
         marker_text = f" [{' / '.join(markers)}]" if markers else ""
