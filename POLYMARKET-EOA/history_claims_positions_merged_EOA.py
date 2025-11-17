@@ -231,47 +231,47 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
         sell_proceeds = float(row.get("sell_proceeds_total") or 0.0)
         buy_size = float(row.get("buy_size_total") or 0.0)
         sell_size = float(row.get("sell_size_total") or 0.0)
-        return buy_cost == 0.0 and sell_proceeds == 0.0 and buy_size == 0.0 and sell_size == 0.0
+        return (
+            buy_cost == 0.0
+            and sell_proceeds == 0.0
+            and buy_size == 0.0
+            and sell_size == 0.0
+        )
 
     settled_rows = [r for r in rows if r.get("has_claim")]
-    unsettled_rows = [r for r in rows if not r.get("has_claim")]
-
     claim_only_rows = [r for r in settled_rows if _is_claim_only(r)]
-    settled_with_positions = [r for r in settled_rows if r not in claim_only_rows]
 
-    total_entries = len(rows)
-    settled_entries = len(settled_rows)
-    unsettled_entries = len(unsettled_rows)
+    # 主统计仅对“有仓位 + 已结算”的条目做汇总，剔除缺失成本/仅 claim 的条目
+    main_rows = [
+        r
+        for r in settled_rows
+        if r.get("has_position_info")
+        and not _is_claim_only(r)
+        and float(r.get("buy_cost_total") or 0.0) > 0.0
+    ]
 
-    total_invest = sum(
-        float(r.get("buy_cost_total") or 0.0) for r in settled_with_positions
-    )
-    total_profit = sum(float(r.get("net_cash_flow") or 0.0) for r in settled_with_positions)
-    success_count = sum(
-        1 for r in settled_with_positions if float(r.get("net_cash_flow") or 0.0) >= 0
-    )
-    failure_count = len(settled_with_positions) - success_count
+    total_entries = len(main_rows)
+    total_invest = sum(float(r.get("buy_cost_total") or 0.0) for r in main_rows)
+    total_profit = sum(float(r.get("net_cash_flow") or 0.0) for r in main_rows)
+    success_count = sum(1 for r in main_rows if float(r.get("net_cash_flow") or 0.0) >= 0)
+    failure_count = len(main_rows) - success_count
     roi = (total_profit / total_invest * 100) if total_invest > 0 else 0.0
 
     print("[SUMMARY] 统计概览：")
+    print(f"总条目={total_entries} | 命中={success_count} | 失利={failure_count}")
     print(
-        f"总条目={total_entries} | 已结算={settled_entries} | 未结算={unsettled_entries}"
-    )
-    print(
-        f"命中={success_count} | 失利={failure_count}（仅统计含持仓数据的已结算）"
-    )
-    print(
-        "总投入≈{:.2f} | 总收益≈{:.2f} | 总收益率≈{:.2f}%（仅已结算）".format(
+        "总投入≈{:.2f} | 总收益≈{:.2f} | 总收益率≈{:.2f}%".format(
             total_invest, total_profit, roi
         )
     )
 
-    if claim_only_rows:
-        claim_only_redeem = sum(
-            float(r.get("redeem_usdc_total") or 0.0) for r in claim_only_rows
+    missing_rows = [r for r in settled_rows if r not in main_rows]
+    if missing_rows:
+        missing_claim_total = sum(
+            float(r.get("redeem_usdc_total") or 0.0) for r in missing_rows
         )
         print(
-            f"[INFO] 仅 claim 无持仓数据的市场：{len(claim_only_rows)} 个，redeem 总额≈{claim_only_redeem:.2f}"
+            f"[MISSING] 仅 claim / 缺失成本条目：{len(missing_rows)} 个，claim 总额≈{missing_claim_total:.2f}"
         )
 
 
