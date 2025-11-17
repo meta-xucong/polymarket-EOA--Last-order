@@ -24,7 +24,18 @@ import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
 
+import requests
+
 UTC_PLUS_8 = timezone(timedelta(hours=8))
+DATA_API_HOST = os.environ.get("DATA_API_HOST", "https://data-api.polymarket.com").rstrip(
+    "/"
+)
+GAMMA_API_HOST = os.environ.get("GAMMA_API_HOST", "https://gamma-api.polymarket.com").rstrip(
+    "/"
+)
+GAMMA_ALT_HOST = os.environ.get("GAMMA_ALT_HOST", "https://gamma.polymarket.com").rstrip(
+    "/"
+)
 
 
 def _condition_id_of(entry: Dict[str, Any]) -> str:
@@ -39,6 +50,34 @@ def _condition_id_of(entry: Dict[str, Any]) -> str:
 def _is_placeholder_key(key: str) -> bool:
     text = str(key or "")
     return text.startswith("UNKNOWN#") or text.endswith("#UNK") or text.endswith("#999")
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return default
+        return float(text)
+    except Exception:
+        return default
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
 
 
 def _canonicalize_key(
@@ -74,6 +113,119 @@ def _fmt_ts(ts: Optional[float]) -> str:
     except Exception:
         return "-"
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _trade_history_endpoints() -> List[str]:
+    hosts = [DATA_API_HOST, GAMMA_API_HOST, GAMMA_ALT_HOST]
+    paths = [
+        "/trades",
+        "/trades/history",
+        "/trades-history",
+        "/fills",
+        "/fills/history",
+        "/fills-history",
+    ]
+    endpoints: List[str] = []
+    for host in hosts:
+        if not host:
+            continue
+        base = host.rstrip("/")
+        for path in paths:
+            endpoint = f"{base}{path}"
+            if endpoint not in endpoints:
+                endpoints.append(endpoint)
+    return endpoints
+
+
+def _extract_items(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [it for it in payload if isinstance(it, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "results", "items", "fills", "positions", "history"):
+            arr = payload.get(key)
+            if isinstance(arr, list):
+                return [it for it in arr if isinstance(it, dict)]
+    return []
+
+
+def _paginate(endpoint: str, params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    for _ in range(max_pages):
+        q = dict(params)
+        if cursor:
+            q["cursor"] = cursor
+        resp = requests.get(endpoint, params=q, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+        cursor = None
+        if isinstance(payload, dict):
+            for key in ("next", "nextCursor", "cursor"):
+                nxt = payload.get(key)
+                if isinstance(nxt, str) and nxt.strip():
+                    cursor = nxt.strip()
+                    break
+        items = _extract_items(payload)
+        if not items:
+            break
+        out.extend(items)
+        if not cursor:
+            break
+    return out
+
+
+def _fetch_trades_fallback(user: str, limit: int = 500, max_pages: int = 2) -> List[Dict[str, Any]]:
+    trades: List[Dict[str, Any]] = []
+    for endpoint in _trade_history_endpoints():
+        try:
+            trades.extend(
+                _paginate(endpoint, {"user": user, "limit": limit}, max_pages)
+            )
+        except Exception:
+            continue
+    return trades
+
+
+def _extract_asset_id(entry: Dict[str, Any]) -> str:
+    for key in ("asset", "tokenId", "token_id", "tokenID", "id"):
+        value = entry.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    token = entry.get("token")
+    if isinstance(token, dict):
+        for key in ("tokenId", "id", "asset"):
+            value = token.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _summarize_buy_trades(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    summary: Dict[str, Dict[str, float]] = {}
+    for trade in trades:
+        asset = _extract_asset_id(trade)
+        if not asset:
+            continue
+        side = (trade.get("side") or "").upper()
+        size = _safe_float(trade.get("size"))
+        price = _safe_float(trade.get("price"))
+        bucket = summary.setdefault(
+            asset,
+            {
+                "buy_size_total": 0.0,
+                "buy_cost_total": 0.0,
+            },
+        )
+        if side == "BUY":
+            bucket["buy_size_total"] += size
+            bucket["buy_cost_total"] += size * price
+    return summary
 
 
 def _merge_positions_and_claims(
@@ -170,6 +322,7 @@ def _merge_positions_and_claims(
         merged.append(
             {
                 "key": key,
+                "asset": (base or {}).get("asset") or (base or {}).get("token_id"),
                 "title": title,
                 "slug": slug,
                 "outcome": outcome,
@@ -190,6 +343,48 @@ def _merge_positions_and_claims(
 
     merged.sort(key=lambda r: (r.get("last_claim_ts") or 0, r.get("key")), reverse=True)
     return merged
+
+
+def _recover_missing_costs_with_trades(
+    rows: List[Dict[str, Any]], wallet: Optional[str]
+) -> None:
+    if not wallet:
+        return
+
+    targets = [
+        r
+        for r in rows
+        if r.get("has_position_info")
+        and (
+            float(r.get("buy_cost_total") or 0.0) <= 0.0
+            or float(r.get("buy_size_total") or 0.0) <= 0.0
+        )
+    ]
+    if not targets:
+        return
+
+    trades = _fetch_trades_fallback(wallet)
+    summary = _summarize_buy_trades(trades)
+    if not summary:
+        return
+
+    for row in targets:
+        asset = row.get("asset")
+        if not asset:
+            continue
+        fb = summary.get(asset)
+        if not fb:
+            continue
+        buy_size = float(fb.get("buy_size_total") or 0.0)
+        buy_cost = float(fb.get("buy_cost_total") or 0.0)
+        if buy_size <= 0 or buy_cost <= 0:
+            continue
+        row["buy_size_total"] = buy_size
+        row["buy_cost_total"] = buy_cost
+        row["net_cash_flow"] = -buy_cost + float(row.get("sell_proceeds_total") or 0.0) + float(
+            row.get("redeem_usdc_total") or 0.0
+        )
+        row["cost_recovered_via_trades"] = True
 
 
 def _print_merged(rows: List[Dict[str, Any]]) -> None:
@@ -231,47 +426,70 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
         sell_proceeds = float(row.get("sell_proceeds_total") or 0.0)
         buy_size = float(row.get("buy_size_total") or 0.0)
         sell_size = float(row.get("sell_size_total") or 0.0)
-        return buy_cost == 0.0 and sell_proceeds == 0.0 and buy_size == 0.0 and sell_size == 0.0
+        return (
+            buy_cost == 0.0
+            and sell_proceeds == 0.0
+            and buy_size == 0.0
+            and sell_size == 0.0
+        )
 
     settled_rows = [r for r in rows if r.get("has_claim")]
-    unsettled_rows = [r for r in rows if not r.get("has_claim")]
 
-    claim_only_rows = [r for r in settled_rows if _is_claim_only(r)]
-    settled_with_positions = [r for r in settled_rows if r not in claim_only_rows]
+    # 主统计：已结算 + 有仓位 + 有成本，格式对齐旧版
+    main_rows = [
+        r
+        for r in settled_rows
+        if r.get("has_position_info")
+        and not _is_claim_only(r)
+        and float(r.get("buy_cost_total") or 0.0) > 0.0
+    ]
 
-    total_entries = len(rows)
-    settled_entries = len(settled_rows)
-    unsettled_entries = len(unsettled_rows)
-
-    total_invest = sum(
-        float(r.get("buy_cost_total") or 0.0) for r in settled_with_positions
-    )
-    total_profit = sum(float(r.get("net_cash_flow") or 0.0) for r in settled_with_positions)
-    success_count = sum(
-        1 for r in settled_with_positions if float(r.get("net_cash_flow") or 0.0) >= 0
-    )
-    failure_count = len(settled_with_positions) - success_count
+    total_entries = len(main_rows)
+    total_invest = sum(float(r.get("buy_cost_total") or 0.0) for r in main_rows)
+    total_profit = sum(float(r.get("net_cash_flow") or 0.0) for r in main_rows)
+    success_count = sum(1 for r in main_rows if float(r.get("net_cash_flow") or 0.0) >= 0)
+    failure_count = len(main_rows) - success_count
     roi = (total_profit / total_invest * 100) if total_invest > 0 else 0.0
 
     print("[SUMMARY] 统计概览：")
+    print(f"总条目={total_entries} | 命中={success_count} | 失利={failure_count}")
     print(
-        f"总条目={total_entries} | 已结算={settled_entries} | 未结算={unsettled_entries}"
-    )
-    print(
-        f"命中={success_count} | 失利={failure_count}（仅统计含持仓数据的已结算）"
-    )
-    print(
-        "总投入≈{:.2f} | 总收益≈{:.2f} | 总收益率≈{:.2f}%（仅已结算）".format(
+        "总投入≈{:.2f} | 总收益≈{:.2f} | 总收益率≈{:.2f}%".format(
             total_invest, total_profit, roi
         )
     )
 
-    if claim_only_rows:
-        claim_only_redeem = sum(
-            float(r.get("redeem_usdc_total") or 0.0) for r in claim_only_rows
+    # 未结算但有成本的条目单独统计
+    pending_rows = [
+        r
+        for r in rows
+        if r.get("has_position_info")
+        and not r.get("has_claim")
+        and float(r.get("buy_cost_total") or 0.0) > 0.0
+    ]
+    if pending_rows:
+        pending_invest = sum(
+            float(r.get("buy_cost_total") or 0.0) for r in pending_rows
+        )
+        pending_cash_flow = sum(
+            float(r.get("net_cash_flow") or 0.0) for r in pending_rows
+        )
+        pending_roi = (
+            pending_cash_flow / pending_invest * 100 if pending_invest > 0 else 0.0
+        )
+        print("[PENDING] 未结算概览：")
+        print(
+            f"总条目={len(pending_rows)} | 总投入≈{pending_invest:.2f} | 当前净现金流≈{pending_cash_flow:.2f} | 当前收益率≈{pending_roi:.2f}%"
+        )
+
+    # 仅 claim 或缺失成本的条目单独汇总 claim 总额
+    missing_rows = [r for r in settled_rows if r not in main_rows]
+    if missing_rows:
+        missing_claim_total = sum(
+            float(r.get("redeem_usdc_total") or 0.0) for r in missing_rows
         )
         print(
-            f"[INFO] 仅 claim 无持仓数据的市场：{len(claim_only_rows)} 个，redeem 总额≈{claim_only_redeem:.2f}"
+            f"[MISSING] 仅 claim / 缺失成本条目：{len(missing_rows)} 个，claim 总额≈{missing_claim_total:.2f}"
         )
 
 
@@ -366,6 +584,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
 
     merged_rows = _merge_positions_and_claims(positions_payload, claims_payload)
+    _recover_missing_costs_with_trades(
+        merged_rows,
+        positions_payload.get("wallet")
+        or claims_payload.get("wallet")
+        or os.environ.get("POLY_EOA_ADDRESS"),
+    )
     _print_merged(merged_rows)
     _print_summary(merged_rows)
 

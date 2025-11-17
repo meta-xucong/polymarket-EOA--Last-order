@@ -1081,6 +1081,34 @@ def _print_claim_only_summary(
         print(f" - {title} | {outcome} | token_id={asset} | claim≈{claim_text}")
 
 
+def _print_missing_cost_claim_summary(missing_rows: List[Dict[str, Any]]) -> None:
+    """汇总缺少买入成本的条目，只关注 claim 金额。"""
+
+    if not missing_rows:
+        return
+
+    claim_total = 0.0
+    for row in missing_rows:
+        amt = row.get("claimAmount")
+        if isinstance(amt, (int, float)):
+            claim_total += float(amt)
+
+    print(
+        "\n[MISSING] 缺少买入成本的条目：{} 条 | claim 总额≈{}".format(
+            len(missing_rows), _vp_fmt_money(claim_total)
+        )
+    )
+
+    for row in missing_rows:
+        title = row.get("title") or row.get("marketSlug") or row.get("asset")
+        outcome = row.get("outcome") or "-"
+        claim_text = "-"
+        amt = row.get("claimAmount")
+        if isinstance(amt, (int, float)):
+            claim_text = _vp_fmt_money(amt)
+        print(f" - {title} | {outcome} | token_id={row.get('asset')} | claim≈{claim_text}")
+
+
 def _compose_position_rows(
     positions: Dict[str, BuyPosition],
     realized: Dict[str, Dict[str, Any]],
@@ -1435,8 +1463,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("\n[HISTORY] 历史买入持仓（含结算盈亏）：")
     stats_rows = [r for r in rows if not r.get("missingCost")]
+    missing_rows = [r for r in rows if r.get("missingCost")]
     total_entries = len(stats_rows)
-    excluded_entries = len(rows) - total_entries
     success_count = 0
     failure_count = 0
     total_invest = 0.0
@@ -1530,11 +1558,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             _vp_fmt_money(total_invest), _vp_fmt_money(total_profit), roi
         )
     )
-    if excluded_entries:
-        print(
-            f"[INFO] 有 {excluded_entries} 条记录缺少买入成本，已标记为“缺成本”并未计入上述统计。"
-        )
-
+    _print_missing_cost_claim_summary(missing_rows)
     _print_claim_only_summary(claim_only_assets, claim_only_meta, realized_map)
 
     if unresolved_but_marked:
