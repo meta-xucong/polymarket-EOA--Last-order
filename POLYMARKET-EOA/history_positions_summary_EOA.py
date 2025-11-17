@@ -187,6 +187,16 @@ def _extract_outcome_names(raw: Dict[str, Any]) -> List[str]:
     return []
 
 
+def _trade_side(raw: Dict[str, Any]) -> str:
+    """兼容旧版字段的成交方向解析，优先返回 BUY/SELL。"""
+
+    for key in ("side", "type", "tradeType", "orderType", "action"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+    return ""
+
+
 _MARKET_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 
 
@@ -681,7 +691,7 @@ class BuyPosition:
 def _summarize_buy_trades(trades: Iterable[Dict[str, Any]]) -> Dict[str, BuyPosition]:
     summary: Dict[str, BuyPosition] = {}
     for trade in trades:
-        side = (trade.get("side") or "").upper()
+        side = _trade_side(trade)
         if side != "BUY":
             continue
         asset = _extract_asset_id(trade)
@@ -708,7 +718,7 @@ def _summarize_trade_cashflow(trades: Iterable[Dict[str, Any]]) -> Dict[str, Dic
         asset = _extract_asset_id(trade)
         if not asset:
             continue
-        side = (trade.get("side") or "").upper()
+        side = _trade_side(trade)
         size = _safe_float(trade.get("size"))
         price = _safe_float(trade.get("price"))
         bucket = summary.setdefault(
@@ -1068,7 +1078,7 @@ def _print_claim_only_summary(
         if isinstance(amt, (int, float)):
             claim_only_amount += float(amt)
     print(
-        "\n[INFO] 仅发现 claim 记录、缺少买入/成交数据的市场：{} 个 | 领取总额≈{}".format(
+        "\n[INFO] 仅发现 claim/结算记录、未能获取 BUY 成本的市场：{} 个 | 领取总额≈{}".format(
             claim_only_count, _vp_fmt_money(claim_only_amount)
         )
     )
@@ -1401,34 +1411,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     fallback_costs = _collect_fallback_buy_costs(history_entries, current_positions)
     _apply_fallback_positions(buy_positions, fallback_costs)
 
-    claim_only_assets = {
-        asset
-        for asset, info in realized_map.items()
-        if asset not in buy_positions
-        and (info.get("was_claimed") or isinstance(info.get("claim_amount"), (int, float)))
-    }
+    claim_only_assets: Set[str] = set()
+    for asset, _info in realized_map.items():
+        bucket = buy_positions.get(asset)
+        total_cost = bucket.total_cost if bucket else 0.0
+        if bucket is None or total_cost <= 0:
+            claim_only_assets.add(asset)
 
-    market_meta = _lookup_markets_for_assets(buy_positions.keys())
+    assets_for_meta: Set[str] = set(buy_positions.keys()) | claim_only_assets
+    market_meta = _lookup_markets_for_assets(assets_for_meta)
     rows = _compose_position_rows(
         buy_positions, realized_map, market_meta, trade_cashflow, fallback_costs
     )
 
-    claim_only_meta: Dict[str, Dict[str, Any]] = {}
-    if claim_only_assets:
-        claim_only_meta = _lookup_markets_for_assets(claim_only_assets)
+    claim_only_meta: Dict[str, Dict[str, Any]] = {
+        asset: market_meta.get(asset) or {} for asset in claim_only_assets
+    }
 
     if args.json_out is not None:
         claim_only_markets: List[Dict[str, Any]] = []
         for asset in claim_only_assets:
             info = realized_map.get(asset) or {}
             meta = claim_only_meta.get(asset) or {}
+            resolved_outcome = info.get("resolved_outcome") or meta.get(
+                "market_win_outcome"
+            )
             claim_only_markets.append(
                 {
                     "asset": asset,
                     "title": meta.get("market_title") or meta.get("slug") or meta.get("market_slug") or "",
                     "outcome": meta.get("token_label") or info.get("resolved_outcome") or "",
                     "claimAmount": info.get("claim_amount"),
-                    "resolvedOutcome": info.get("resolved_outcome"),
+                    "resolvedOutcome": resolved_outcome,
+                    "settlementPrice": info.get("settlement_price"),
                     "resolutionTime": info.get("timestamp"),
                     "resolutionStatus": info.get("status"),
                     "source": info.get("source"),
