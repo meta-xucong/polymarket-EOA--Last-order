@@ -244,78 +244,83 @@ def main(argv: List[str]) -> int:
     gas_price = int(w3.eth.gas_price * max(float(args.gas_mult), 0.1))
 
     # 若有可兑付，先执行 claim；否则仅提示但不退出，让后续 unwrap 生效
+    claim_error: Optional[Exception] = None
     claim_failures = 0
-    if groups:
-        print(f"[INFO] 即将处理 {len(groups)} 笔市场 Claim。")
-        sent = 0
-        for i, g in enumerate(groups, 1):
-            title = g.get("title","")
-            condition = _norm_b32(g.get("conditionId", ZERO32))
-            parent = _norm_b32(g.get("parentCollectionId", ZERO32))
-            index_sets = g.get("indexSets") or [1,2]
-            token_ids = g.get("tokenIds", [])
+    try:
+        if groups:
+            print(f"[INFO] 即将处理 {len(groups)} 笔市场 Claim。")
+            sent = 0
+            for i, g in enumerate(groups, 1):
+                title = g.get("title","")
+                condition = _norm_b32(g.get("conditionId", ZERO32))
+                parent = _norm_b32(g.get("parentCollectionId", ZERO32))
+                index_sets = g.get("indexSets") or [1,2]
+                token_ids = g.get("tokenIds", [])
+
+                print("-"*72)
+                print(f"[{i:02d}] 市场：{title}")
+                print(f"[{i:02d}] 参数：parent={parent} | condition={condition} | indexSets={index_sets}")
+
+                known_token_ids: Set[int] = set()
+                for t in token_ids:
+                    try: known_token_ids.add(int(t))
+                    except: pass
+
+                # 选择正确 collateral 并干跑余额校验
+                col, cand_ids, bals = _choose_collateral(ctf, owner, parent, condition, index_sets, known_token_ids, prefer_usdce_first=True)
+                if not col:
+                    print("[SKIP] 干跑校验：USDC.e/WCOL 均为 0，跳过。")
+                    continue
+
+                have = sum(int(x) for x in bals)
+                print(f"[TRACE] collateral={col} | positionIds={cand_ids} | balances={bals}")
+                if have <= 0:
+                    print("[SKIP] 干跑校验：余额为 0，跳过。")
+                    continue
+
+                # 预执行保护
+                call = ctf.functions.redeemPositions(col, parent, condition, index_sets)
+                try:
+                    call.call({"from": owner})
+                except Exception as e:
+                    print(f"[WARN] 预执行失败：{e}; 跳过。")
+                    continue
+
+                # 上链
+                try:
+                    tx = call.build_transaction({"from": owner, "nonce": nonce, "gasPrice": gas_price})
+                    try:
+                        est = w3.eth.estimate_gas(tx)
+                        tx["gas"] = int(est * 1.2)
+                    except Exception:
+                        tx["gas"] = 200000
+                    signed = w3.eth.account.sign_transaction(tx, private_key=priv)
+                    txh = w3.eth.send_raw_transaction(signed.rawTransaction)
+                    rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=120)
+                    print(f"[INFO] 交易成功 {txh.hex()} | gasUsed={rcpt.gasUsed}")
+                    nonce += 1
+                    sent += 1
+                except Exception as exc:
+                    claim_failures += 1
+                    if _looks_like_panic_overflow(exc):
+                        print(
+                            f"[WARN] redeemPositions 被链上拒绝（Panic 0x11，可能已兑付完毕）：{exc}."
+                            " 继续处理下一笔。"
+                        )
+                    else:
+                        print(f"[WARN] redeemPositions 交易失败：{exc}。继续处理下一笔。")
+                    # nonce 只有在交易成功广播并返回 receipt 时才增加
+                    continue
 
             print("-"*72)
-            print(f"[{i:02d}] 市场：{title}")
-            print(f"[{i:02d}] 参数：parent={parent} | condition={condition} | indexSets={index_sets}")
-
-            known_token_ids: Set[int] = set()
-            for t in token_ids:
-                try: known_token_ids.add(int(t))
-                except: pass
-
-            # 选择正确 collateral 并干跑余额校验
-            col, cand_ids, bals = _choose_collateral(ctf, owner, parent, condition, index_sets, known_token_ids, prefer_usdce_first=True)
-            if not col:
-                print("[SKIP] 干跑校验：USDC.e/WCOL 均为 0，跳过。")
-                continue
-
-            have = sum(int(x) for x in bals)
-            print(f"[TRACE] collateral={col} | positionIds={cand_ids} | balances={bals}")
-            if have <= 0:
-                print("[SKIP] 干跑校验：余额为 0，跳过。")
-                continue
-
-            # 预执行保护
-            call = ctf.functions.redeemPositions(col, parent, condition, index_sets)
-            try:
-                call.call({"from": owner})
-            except Exception as e:
-                print(f"[WARN] 预执行失败：{e}; 跳过。")
-                continue
-
-            # 上链
-            try:
-                tx = call.build_transaction({"from": owner, "nonce": nonce, "gasPrice": gas_price})
-                try:
-                    est = w3.eth.estimate_gas(tx)
-                    tx["gas"] = int(est * 1.2)
-                except Exception:
-                    tx["gas"] = 200000
-                signed = w3.eth.account.sign_transaction(tx, private_key=priv)
-                txh = w3.eth.send_raw_transaction(signed.rawTransaction)
-                rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=120)
-                print(f"[INFO] 交易成功 {txh.hex()} | gasUsed={rcpt.gasUsed}")
-                nonce += 1
-                sent += 1
-            except Exception as exc:
-                claim_failures += 1
-                if _looks_like_panic_overflow(exc):
-                    print(
-                        f"[WARN] redeemPositions 被链上拒绝（Panic 0x11，可能已兑付完毕）：{exc}."
-                        " 继续处理下一笔。"
-                    )
-                else:
-                    print(f"[WARN] redeemPositions 交易失败：{exc}。继续处理下一笔。")
-                # nonce 只有在交易成功广播并返回 receipt 时才增加
-                continue
-
-        print("-"*72)
-        print(f"[DONE] Claim 流程结束，发送交易 {sent} 笔。")
-        if claim_failures:
-            print(f"[WARN] 其中 {claim_failures} 笔在链上被拒绝或已无可兑付余额，请核查上方日志。")
-    else:
-        print("[INFO] 没有可兑付的市场（Data-API / 本地输入为空）。继续尝试自动 unwrap WCOL。")
+            print(f"[DONE] Claim 流程结束，发送交易 {sent} 笔。")
+            if claim_failures:
+                print(f"[WARN] 其中 {claim_failures} 笔在链上被拒绝或已无可兑付余额，请核查上方日志。")
+        else:
+            print("[INFO] 没有可兑付的市场（Data-API / 本地输入为空）。继续尝试自动 unwrap WCOL。")
+    except Exception as e:
+        claim_error = e
+        print(f"[ERR] Claim 流程异常：{e}。将继续尝试自动 unwrap WCOL。")
 
     # 自动 unwrap（总是执行，除非被显式关闭）
     if not args.no_unwrap:
@@ -328,6 +333,10 @@ def main(argv: List[str]) -> int:
         min_units = int(float(args.unwrap_min) * (10 ** dec))
         delta, txh = unwrap_wcol_all(w3, owner, priv, gas_price, nonce, min_amount_units=min_units)
         nonce += delta
+
+    if claim_error:
+        print("[INFO] Claim 流程已执行：退出码 -1。")
+        return -1
 
     return 0
 
