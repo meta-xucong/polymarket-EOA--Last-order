@@ -651,9 +651,19 @@ class BuyPosition:
 
 
 def _summarize_buy_trades(trades: Iterable[Dict[str, Any]]) -> Dict[str, BuyPosition]:
+    """按照旧版逻辑，以 BUY 方向统计买入成本。"""
+
+    def _trade_side(raw: Dict[str, Any]) -> str:
+        # 兼容早期字段命名，优先使用 side，找不到时回退到 type / tradeType 等。
+        for key in ("side", "type", "tradeType", "orderType", "action"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().upper()
+        return ""
+
     summary: Dict[str, BuyPosition] = {}
     for trade in trades:
-        side = (trade.get("side") or "").upper()
+        side = _trade_side(trade)
         if side != "BUY":
             continue
         asset = _extract_asset_id(trade)
@@ -903,6 +913,39 @@ def _compose_position_rows(
     return rows
 
 
+def _compose_claim_only_rows(
+    claim_only: Dict[str, Dict[str, Any]],
+    markets: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for asset, info in claim_only.items():
+        market_meta = markets.get(asset)
+        token_meta = _resolve_token_meta(asset, market_meta)
+        resolved_ts = info.get("timestamp") or _market_resolution_timestamp(market_meta)
+
+        claim_amount = info.get("claim_amount")
+        if claim_amount is None and isinstance(info.get("cash_pnl"), (int, float)):
+            claim_amount = float(info.get("cash_pnl"))
+
+        rows.append(
+            {
+                "asset": asset,
+                "title": token_meta.get("market_title") or "",
+                "tokenOutcomeLabel": token_meta.get("token_label") or "",
+                "resolvedOutcome": info.get("resolved_outcome")
+                or token_meta.get("market_win_outcome")
+                or "",
+                "settlementPrice": info.get("settlement_price"),
+                "claimAmount": claim_amount,
+                "timestamp": resolved_ts,
+                "source": info.get("source") or "",
+            }
+        )
+
+    rows.sort(key=lambda r: (r.get("timestamp") or 0), reverse=True)
+    return rows
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Polymarket 历史仓位统计工具")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
@@ -1007,14 +1050,26 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     buy_positions = _summarize_buy_trades(filtered_trades)
     realized_map = _summarize_activity(filtered_history)
-    market_meta = _lookup_markets_for_assets(buy_positions.keys())
+
+    # 找出“只有 claim / 结算信息，但没有 BUY 成本”的资产，便于单独汇总。
+    claim_only_assets: Dict[str, Dict[str, Any]] = {}
+    for asset, info in realized_map.items():
+        bucket = buy_positions.get(asset)
+        total_cost = bucket.total_cost if bucket else 0.0
+        if bucket is None or total_cost <= 0:
+            claim_only_assets[asset] = info
+
+    assets_for_meta: Set[str] = set(buy_positions.keys()) | set(claim_only_assets.keys())
+    market_meta = _lookup_markets_for_assets(assets_for_meta)
     rows = _compose_position_rows(buy_positions, realized_map, market_meta)
+    claim_only_rows = _compose_claim_only_rows(claim_only_assets, market_meta)
 
     if args.json:
         output = {
             "wallet": user,
             "since_date_utc8": since_date_text,
             "positions": rows,
+            "claim_only": claim_only_rows,
             "trades": filtered_trades,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
@@ -1114,6 +1169,36 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(
                 f" - {item.get('title') or '-'} (token_id={item.get('asset')}) | {item.get('reason')}"
             )
+
+    if claim_only_rows:
+        print("\n[CLAIM-ONLY] 仅发现 claim / 结算记录（未获取 BUY 成本，未计入主统计）：")
+        total_claim_amount = 0.0
+        for idx, row in enumerate(claim_only_rows, 1):
+            claim_amount = row.get("claimAmount")
+            if isinstance(claim_amount, (int, float)):
+                total_claim_amount += float(claim_amount)
+                claim_text = _vp_fmt_money(float(claim_amount))
+            else:
+                claim_text = "-"
+            settlement_price = row.get("settlementPrice")
+            if isinstance(settlement_price, (int, float)):
+                settle_text = f"{float(settlement_price):.4f}"
+            else:
+                settle_text = "-"
+            resolved_outcome = row.get("resolvedOutcome") or "-"
+            token_label = row.get("tokenOutcomeLabel") or "-"
+            resolution_time = _fmt_timestamp_local(row.get("timestamp"))
+            print(
+                f" {idx:>2}. {row.get('title') or '-'} | {token_label} | token_id={row.get('asset')}"
+            )
+            print(
+                "     "
+                f"claim≈{claim_text} | 结算价≈{settle_text} | 结算结果={resolved_outcome} | 时间={resolution_time}"
+            )
+            print("     缘由：未能在 /trades 中找到 BUY 成本，仅保留 claim 记录以便复核。")
+        print(
+            f"共 {len(claim_only_rows)} 条 | 合计领取≈{_vp_fmt_money(total_claim_amount)} （已从收益统计中排除）"
+        )
 
     return 0
 
