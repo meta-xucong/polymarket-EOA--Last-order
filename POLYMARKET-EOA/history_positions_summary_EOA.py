@@ -590,6 +590,29 @@ def _extract_asset_id(entry: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_condition_id(entry: Dict[str, Any]) -> str:
+    """在 trade/activity/position 记录中提取 conditionId。"""
+
+    for key in ("conditionId", "condition_id", "conditionID"):
+        value = entry.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+
+    market_obj = entry.get("market") or entry.get("condition")
+    if isinstance(market_obj, dict):
+        for key in ("conditionId", "condition_id", "id"):
+            value = market_obj.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
 def _extract_cash_pnl(entry: Dict[str, Any]) -> Optional[float]:
     for key in (
         "cashPnl",
@@ -715,7 +738,12 @@ def _collect_fallback_buy_costs(
     fallback: Dict[str, Dict[str, Any]] = {}
 
     def _record(
-        asset: str, size: Any, price: Any, source: str, ts: Optional[float] = None
+        asset: str,
+        size: Any,
+        price: Any,
+        source: str,
+        ts: Optional[float] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not asset:
             return
@@ -737,6 +765,8 @@ def _collect_fallback_buy_costs(
             "source": source,
             "timestamp": ts,
         }
+        if extra:
+            fallback[asset].update(extra)
 
     buy_price_keys = (
         "avgPrice",
@@ -754,14 +784,54 @@ def _collect_fallback_buy_costs(
         asset = _extract_asset_id(entry)
         price = _first_present(entry, buy_price_keys)
         size = _first_present(entry, size_keys)
-        _record(asset, size, price, "history", _entry_timestamp(entry))
+        _record(
+            asset,
+            size,
+            price,
+            "history",
+            _entry_timestamp(entry),
+            extra={
+                "title": entry.get("title")
+                or entry.get("market")
+                or entry.get("marketTitle")
+                or entry.get("question"),
+                "outcome": entry.get("outcome")
+                or entry.get("outcomeName")
+                or entry.get("tokenName"),
+                "condition_id": _extract_condition_id(entry),
+                "market_slug": entry.get("marketSlug")
+                or entry.get("slug")
+                or entry.get("eventSlug"),
+                "icon": entry.get("icon") or "",
+            },
+        )
 
     if current_positions:
         for pos in current_positions:
             asset = _extract_asset_id(pos)
             size = _first_present(pos, size_keys)
             price = _first_present(pos, ("avgPrice", "averagePrice", "entryPrice", "price"))
-            _record(asset, size, price, "positions")
+            _record(
+                asset,
+                size,
+                price,
+                "positions",
+                _entry_timestamp(pos),
+                extra={
+                    "title": pos.get("title")
+                    or pos.get("market")
+                    or pos.get("marketTitle")
+                    or pos.get("question"),
+                    "outcome": pos.get("outcome")
+                    or pos.get("outcomeName")
+                    or pos.get("tokenName"),
+                    "condition_id": _extract_condition_id(pos),
+                    "market_slug": pos.get("marketSlug")
+                    or pos.get("slug")
+                    or pos.get("eventSlug"),
+                    "icon": pos.get("icon") or "",
+                },
+            )
 
     return fallback
 
@@ -787,6 +857,11 @@ def _apply_fallback_positions(
         bp = BuyPosition(asset=asset)
         bp.total_size = size
         bp.total_cost = total_cost
+        bp.title = str(fb.get("title") or "")
+        bp.outcome = str(fb.get("outcome") or "")
+        bp.market_slug = str(fb.get("market_slug") or "")
+        bp.condition_id = str(fb.get("condition_id") or "")
+        bp.icon = str(fb.get("icon") or "")
         ts = _optional_float(fb.get("timestamp"))
         if ts is not None:
             bp.first_ts = ts
@@ -985,6 +1060,7 @@ def _compose_position_rows(
         realized_entry = realized.get(asset)
         market_meta = markets.get(asset)
         token_meta = _resolve_token_meta(asset, market_meta)
+        condition_id = bucket.condition_id or _extract_condition_id(market_meta)
         resolved_ts = None
         if realized_entry and realized_entry.get("is_resolved") and realized_entry.get(
             "timestamp"
@@ -999,7 +1075,7 @@ def _compose_position_rows(
         if not resolution_status:
             resolution_status = "已结算" if token_meta.get("market_resolved") else None
         outcome_label = bucket.outcome or token_meta.get("token_label") or ""
-        key = make_key(bucket.condition_id, token_meta.get("token_index"), outcome_label)
+        key = make_key(condition_id, token_meta.get("token_index"), outcome_label)
         trade_stats = trade_cashflow.get(asset, {})
         total_size = bucket.total_size
         total_cost = bucket.total_cost
@@ -1042,7 +1118,7 @@ def _compose_position_rows(
                 "outcome": outcome_label,
                 "side": token_meta.get("token_side") or None,
                 "marketSlug": bucket.market_slug or token_meta.get("market_slug") or "",
-                "conditionId": bucket.condition_id,
+                "conditionId": condition_id,
                 "icon": bucket.icon,
                 "totalSize": total_size,
                 "avgEntryPrice": avg_price,
