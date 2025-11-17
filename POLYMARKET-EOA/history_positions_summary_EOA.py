@@ -590,6 +590,29 @@ def _extract_asset_id(entry: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_condition_id(entry: Dict[str, Any]) -> str:
+    """在 trade/activity/position 记录中提取 conditionId。"""
+
+    for key in ("conditionId", "condition_id", "conditionID"):
+        value = entry.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+
+    market_obj = entry.get("market") or entry.get("condition")
+    if isinstance(market_obj, dict):
+        for key in ("conditionId", "condition_id", "id"):
+            value = market_obj.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
 def _extract_cash_pnl(entry: Dict[str, Any]) -> Optional[float]:
     for key in (
         "cashPnl",
@@ -619,6 +642,7 @@ class BuyPosition:
     total_cost: float = 0.0
     first_ts: Optional[float] = None
     last_ts: Optional[float] = None
+    recovered_cost_source: Optional[str] = None
 
     def register_trade(self, trade: Dict[str, Any], size: float, price: float, ts: Optional[float]) -> None:
         if size <= 0:
@@ -703,6 +727,147 @@ def _summarize_trade_cashflow(trades: Iterable[Dict[str, Any]]) -> Dict[str, Dic
             bucket["sell_size_total"] += size
             bucket["sell_proceeds_total"] += size * price
     return summary
+
+
+def _collect_fallback_buy_costs(
+    history_entries: Iterable[Dict[str, Any]],
+    current_positions: Optional[Iterable[Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """回溯买入成本：优先从历史记录提取 buy price/size，其次使用当前持仓。"""
+
+    fallback: Dict[str, Dict[str, Any]] = {}
+
+    def _record(
+        asset: str,
+        size: Any,
+        price: Any,
+        source: str,
+        ts: Optional[float] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not asset:
+            return
+        size_val = _optional_float(size)
+        price_val = _optional_float(price)
+        if price_val is None or price_val <= 0:
+            return
+        total_cost = None
+        if isinstance(size_val, (int, float)) and size_val > 0:
+            total_cost = size_val * price_val
+        prev = fallback.get(asset)
+        # 如果已有记录且拥有成本值，则优先保留已有的；否则回填新的
+        if prev and isinstance(prev.get("total_cost"), (int, float)) and prev.get("total_cost") > 0:
+            return
+        fallback[asset] = {
+            "size": size_val,
+            "price": price_val,
+            "total_cost": total_cost,
+            "source": source,
+            "timestamp": ts,
+        }
+        if extra:
+            fallback[asset].update(extra)
+
+    buy_price_keys = (
+        "avgPrice",
+        "averagePrice",
+        "entryPrice",
+        "buyPrice",
+        "price",
+        "fillPrice",
+        "executionPrice",
+        "tradePrice",
+    )
+    size_keys = ("size", "quantity", "tokens", "position", "shares")
+
+    for entry in history_entries:
+        asset = _extract_asset_id(entry)
+        price = _first_present(entry, buy_price_keys)
+        size = _first_present(entry, size_keys)
+        _record(
+            asset,
+            size,
+            price,
+            "history",
+            _entry_timestamp(entry),
+            extra={
+                "title": entry.get("title")
+                or entry.get("market")
+                or entry.get("marketTitle")
+                or entry.get("question"),
+                "outcome": entry.get("outcome")
+                or entry.get("outcomeName")
+                or entry.get("tokenName"),
+                "condition_id": _extract_condition_id(entry),
+                "market_slug": entry.get("marketSlug")
+                or entry.get("slug")
+                or entry.get("eventSlug"),
+                "icon": entry.get("icon") or "",
+            },
+        )
+
+    if current_positions:
+        for pos in current_positions:
+            asset = _extract_asset_id(pos)
+            size = _first_present(pos, size_keys)
+            price = _first_present(pos, ("avgPrice", "averagePrice", "entryPrice", "price"))
+            _record(
+                asset,
+                size,
+                price,
+                "positions",
+                _entry_timestamp(pos),
+                extra={
+                    "title": pos.get("title")
+                    or pos.get("market")
+                    or pos.get("marketTitle")
+                    or pos.get("question"),
+                    "outcome": pos.get("outcome")
+                    or pos.get("outcomeName")
+                    or pos.get("tokenName"),
+                    "condition_id": _extract_condition_id(pos),
+                    "market_slug": pos.get("marketSlug")
+                    or pos.get("slug")
+                    or pos.get("eventSlug"),
+                    "icon": pos.get("icon") or "",
+                },
+            )
+
+    return fallback
+
+
+def _apply_fallback_positions(
+    buy_positions: Dict[str, BuyPosition], fallback_costs: Dict[str, Dict[str, Any]]
+) -> None:
+    """将 legacy 渠道的成本信息用于补建缺失的 BuyPosition。"""
+
+    for asset, fb in fallback_costs.items():
+        if asset in buy_positions:
+            continue
+        size = _optional_float(fb.get("size"))
+        price = _optional_float(fb.get("price"))
+        total_cost = _optional_float(fb.get("total_cost"))
+        if not (isinstance(size, (int, float)) and size > 0):
+            continue
+        if total_cost is None or total_cost <= 0:
+            if isinstance(price, (int, float)) and price > 0:
+                total_cost = size * price
+        if total_cost is None or total_cost <= 0:
+            continue
+        bp = BuyPosition(asset=asset)
+        bp.total_size = size
+        bp.total_cost = total_cost
+        bp.title = str(fb.get("title") or "")
+        bp.outcome = str(fb.get("outcome") or "")
+        bp.market_slug = str(fb.get("market_slug") or "")
+        bp.condition_id = str(fb.get("condition_id") or "")
+        bp.icon = str(fb.get("icon") or "")
+        ts = _optional_float(fb.get("timestamp"))
+        if ts is not None:
+            bp.first_ts = ts
+            bp.last_ts = ts
+        bp.recovered_cost_source = fb.get("source") or "legacy"
+        buy_positions[asset] = bp
 
 
 def _summarize_activity(entries: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -887,12 +1052,15 @@ def _compose_position_rows(
     realized: Dict[str, Dict[str, Any]],
     markets: Dict[str, Dict[str, Any]],
     trade_cashflow: Dict[str, Dict[str, float]],
+    fallback_costs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    fallback_costs = fallback_costs or {}
     for asset, bucket in positions.items():
         realized_entry = realized.get(asset)
         market_meta = markets.get(asset)
         token_meta = _resolve_token_meta(asset, market_meta)
+        condition_id = bucket.condition_id or _extract_condition_id(market_meta)
         resolved_ts = None
         if realized_entry and realized_entry.get("is_resolved") and realized_entry.get(
             "timestamp"
@@ -907,8 +1075,40 @@ def _compose_position_rows(
         if not resolution_status:
             resolution_status = "已结算" if token_meta.get("market_resolved") else None
         outcome_label = bucket.outcome or token_meta.get("token_label") or ""
-        key = make_key(bucket.condition_id, token_meta.get("token_index"), outcome_label)
+        key = make_key(condition_id, token_meta.get("token_index"), outcome_label)
         trade_stats = trade_cashflow.get(asset, {})
+        total_size = bucket.total_size
+        total_cost = bucket.total_cost
+        avg_price = bucket.avg_price
+        fallback_used = False
+        fallback_source = None
+
+        if bucket.recovered_cost_source:
+            fallback_used = True
+            fallback_source = bucket.recovered_cost_source
+
+        if (total_cost <= 0 or total_size <= 0) and asset in fallback_costs:
+            fb = fallback_costs.get(asset) or {}
+            fb_size = _optional_float(fb.get("size"))
+            fb_price = _optional_float(fb.get("price"))
+            fb_cost = _optional_float(fb.get("total_cost"))
+            candidate_size = total_size if total_size > 0 else fb_size
+            candidate_cost = total_cost if total_cost > 0 else None
+            if fb_cost is not None and fb_cost > 0:
+                candidate_cost = fb_cost
+            elif fb_price is not None and fb_price > 0 and candidate_size:
+                candidate_cost = candidate_size * fb_price
+            elif fb_price is not None and fb_price > 0:
+                candidate_cost = fb_price
+            if candidate_size and candidate_size > 0 and candidate_cost and candidate_cost > 0:
+                total_size = candidate_size
+                total_cost = candidate_cost
+                avg_price = candidate_cost / candidate_size
+                fallback_used = True
+                fallback_source = fb.get("source") or "legacy"
+
+        missing_cost = not (total_size > 0 and total_cost > 0)
+
         rows.append(
             {
                 "key": key,
@@ -918,11 +1118,11 @@ def _compose_position_rows(
                 "outcome": outcome_label,
                 "side": token_meta.get("token_side") or None,
                 "marketSlug": bucket.market_slug or token_meta.get("market_slug") or "",
-                "conditionId": bucket.condition_id,
+                "conditionId": condition_id,
                 "icon": bucket.icon,
-                "totalSize": bucket.total_size,
-                "avgEntryPrice": bucket.avg_price,
-                "totalCost": bucket.total_cost,
+                "totalSize": total_size,
+                "avgEntryPrice": avg_price,
+                "totalCost": total_cost,
                 "buy_size_total": trade_stats.get("buy_size_total", 0.0),
                 "buy_cost_total": trade_stats.get("buy_cost_total", 0.0),
                 "sell_size_total": trade_stats.get("sell_size_total", 0.0),
@@ -945,12 +1145,20 @@ def _compose_position_rows(
                 "tokenOutcomeLabel": token_meta.get("token_label") or bucket.outcome or "",
                 "tokenOutcomeIndex": token_meta.get("token_index"),
                 "tokenOutcomeSide": token_meta.get("token_side") or "",
+                "buyCostRecovered": fallback_used,
+                "buyCostSource": fallback_source,
+                "missingCost": missing_cost,
             }
         )
     for row in rows:
         settlement_price = row.get("settlementPrice")
         total_size = row.get("totalSize") or 0.0
         total_cost = row.get("totalCost") or 0.0
+        if row.get("missingCost"):
+            row["derivedPayout"] = None
+            row["derivedPnl"] = None
+            row["derivedOutcomeMatch"] = None
+            continue
         payout = None
         derived_pnl = None
         outcome_match = None
@@ -1121,6 +1329,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     trade_cashflow = _summarize_trade_cashflow(filtered_trades)
     realized_map = _summarize_activity(filtered_history)
 
+    current_positions: List[Dict[str, Any]] = []
+    try:
+        current_positions = _vp_fetch_positions(user)
+    except Exception as exc:
+        if DEBUG_LOG:
+            _debug_print(f"获取当前持仓用于回补成本失败：{exc}")
+
+    fallback_costs = _collect_fallback_buy_costs(history_entries, current_positions)
+    _apply_fallback_positions(buy_positions, fallback_costs)
+
     claim_only_assets = {
         asset
         for asset, info in realized_map.items()
@@ -1129,7 +1347,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
 
     market_meta = _lookup_markets_for_assets(buy_positions.keys())
-    rows = _compose_position_rows(buy_positions, realized_map, market_meta, trade_cashflow)
+    rows = _compose_position_rows(
+        buy_positions, realized_map, market_meta, trade_cashflow, fallback_costs
+    )
 
     claim_only_meta: Dict[str, Dict[str, Any]] = {}
     if claim_only_assets:
@@ -1180,7 +1400,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     print("\n[HISTORY] 历史买入持仓（含结算盈亏）：")
-    total_entries = len(rows)
+    stats_rows = [r for r in rows if not r.get("missingCost")]
+    total_entries = len(stats_rows)
+    excluded_entries = len(rows) - total_entries
     success_count = 0
     failure_count = 0
     total_invest = 0.0
@@ -1191,7 +1413,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         total_size = row.get("totalSize") or 0.0
         avg_price = row.get("avgEntryPrice") or 0.0
         total_cost = row.get("totalCost") or 0.0
-        total_invest += total_cost
         realized_pnl = row.get("realizedPnl")
         resolution_status = row.get("resolutionStatus")
         if not resolution_status:
@@ -1208,12 +1429,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             option_desc = f"{option_desc} (idx={token_index})"
         if token_side:
             option_desc = f"{option_desc} [{token_side}]"
+        markers: List[str] = []
+        if row.get("buyCostRecovered"):
+            source_text = row.get("buyCostSource") or "legacy"
+            markers.append(f"成本回补({source_text})")
+        if row.get("missingCost"):
+            markers.append("缺成本，未计入统计")
+        marker_text = f" [{' / '.join(markers)}]" if markers else ""
         print(
             f"{idx:>2}. {row.get('title') or '-'} | {row.get('outcome') or '-'} | token_id={row.get('asset')}"
         )
         print(
             "    "
-            f"买入方向=BUY | 买入总量={total_size:.4f} | 均价={_vp_fmt_money(avg_price)} | 总成本≈{_vp_fmt_money(total_cost)}"
+            f"买入方向=BUY | 买入总量={total_size:.4f} | 均价={_vp_fmt_money(avg_price)} | 总成本≈{_vp_fmt_money(total_cost)}{marker_text}"
         )
         print(f"    买入选项={option_desc}")
         print(f"    买入时间区间：{first_ts} -> {last_ts}")
@@ -1224,22 +1452,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         derived_payout = row.get("derivedPayout")
         derived_pnl = row.get("derivedPnl")
         outcome_match = row.get("derivedOutcomeMatch")
-        if isinstance(realized_pnl, (int, float)):
-            total_profit += realized_pnl
-        if isinstance(derived_pnl, (int, float)) and isinstance(derived_payout, (int, float)):
-            payout_text = _vp_fmt_money(derived_payout)
-            derived_text = _vp_fmt_money(derived_pnl)
-            match_text = "命中" if outcome_match else "失利"
-            if outcome_match is True:
-                success_count += 1
-            elif outcome_match is False:
-                failure_count += 1
-            print(
-                "    "
-                f"推导结算：{match_text} | 理论赔付≈{payout_text} | 推导盈亏≈{derived_text}"
-            )
+        if row.get("missingCost"):
+            print("    推导结算：缺少买入成本，无法纳入统计。")
         else:
-            print("    推导结算：-")
+            total_invest += total_cost
+            if isinstance(realized_pnl, (int, float)):
+                total_profit += realized_pnl
+            if isinstance(derived_pnl, (int, float)) and isinstance(
+                derived_payout, (int, float)
+            ):
+                payout_text = _vp_fmt_money(derived_payout)
+                derived_text = _vp_fmt_money(derived_pnl)
+                match_text = "命中" if outcome_match else "失利"
+                if outcome_match is True:
+                    success_count += 1
+                elif outcome_match is False:
+                    failure_count += 1
+                print(
+                    "    "
+                    f"推导结算：{match_text} | 理论赔付≈{payout_text} | 推导盈亏≈{derived_text}"
+                )
+            else:
+                print("    推导结算：-")
 
         if row.get("isResolved") and not row.get("resolvedOutcome"):
             unresolved_but_marked.append(
@@ -1262,6 +1496,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             _vp_fmt_money(total_invest), _vp_fmt_money(total_profit), roi
         )
     )
+    if excluded_entries:
+        print(
+            f"[INFO] 有 {excluded_entries} 条记录缺少买入成本，已标记为“缺成本”并未计入上述统计。"
+        )
 
     _print_claim_only_summary(claim_only_assets, claim_only_meta, realized_map)
 
