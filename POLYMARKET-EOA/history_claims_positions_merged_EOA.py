@@ -434,9 +434,8 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
         )
 
     settled_rows = [r for r in rows if r.get("has_claim")]
-    claim_only_rows = [r for r in settled_rows if _is_claim_only(r)]
 
-    # 主统计仅对“有仓位 + 已结算”的条目做汇总，剔除缺失成本/仅 claim 的条目
+    # 主统计：已结算 + 有仓位 + 有成本，格式对齐旧版
     main_rows = [
         r
         for r in settled_rows
@@ -460,6 +459,30 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
         )
     )
 
+    # 未结算但有成本的条目单独统计
+    pending_rows = [
+        r
+        for r in rows
+        if r.get("has_position_info")
+        and not r.get("has_claim")
+        and float(r.get("buy_cost_total") or 0.0) > 0.0
+    ]
+    if pending_rows:
+        pending_invest = sum(
+            float(r.get("buy_cost_total") or 0.0) for r in pending_rows
+        )
+        pending_cash_flow = sum(
+            float(r.get("net_cash_flow") or 0.0) for r in pending_rows
+        )
+        pending_roi = (
+            pending_cash_flow / pending_invest * 100 if pending_invest > 0 else 0.0
+        )
+        print("[PENDING] 未结算概览：")
+        print(
+            f"总条目={len(pending_rows)} | 总投入≈{pending_invest:.2f} | 当前净现金流≈{pending_cash_flow:.2f} | 当前收益率≈{pending_roi:.2f}%"
+        )
+
+    # 仅 claim 或缺失成本的条目单独汇总 claim 总额
     missing_rows = [r for r in settled_rows if r not in main_rows]
     if missing_rows:
         missing_claim_total = sum(
