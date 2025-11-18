@@ -302,7 +302,12 @@ def main(argv: List[str]) -> int:
                     sent += 1
                 except Exception as exc:
                     claim_failures += 1
-                    if _looks_like_panic_overflow(exc):
+                    err_lower = str(exc).lower()
+                    if "result for condition not received yet" in err_lower:
+                        print(
+                            "[WARN] redeemPositions 交易失败：预言机结果尚未提交，市场未结算。继续处理下一笔。"
+                        )
+                    elif _looks_like_panic_overflow(exc):
                         print(
                             f"[WARN] redeemPositions 被链上拒绝（Panic 0x11，可能已兑付完毕）：{exc}."
                             " 继续处理下一笔。"
