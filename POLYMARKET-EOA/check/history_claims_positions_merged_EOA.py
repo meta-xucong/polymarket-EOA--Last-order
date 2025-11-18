@@ -475,6 +475,28 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
             f"[MISSING] 已 claim 但缺买入成本：{len(missing_rows)} 个，claim 总额≈{missing_claim_total:.2f}"
         )
 
+    failure_rows = [
+        r
+        for r in main_rows
+        if float(r.get("redeem_usdc_total") or 0.0)
+        - float(r.get("buy_cost_total") or 0.0)
+        < 0
+    ]
+    if failure_rows:
+        print("\n[FAILED] 失利条目明细：")
+        for idx, row in enumerate(failure_rows, 1):
+            buy_cost = float(row.get("buy_cost_total") or 0.0)
+            claim_total = float(row.get("redeem_usdc_total") or 0.0)
+            profit = claim_total - buy_cost
+            roi_each = (profit / buy_cost * 100) if buy_cost > 0 else 0.0
+            print(
+                f"{idx:>3}. {row.get('title') or '-'} | {row.get('outcome') or '-'} | key={row.get('key')}"
+            )
+            print(
+                "     "
+                f"买入成本≈{buy_cost:.2f} | 总CLAIM≈{claim_total:.2f} | 收益≈{profit:.2f} | 收益率≈{roi_each:.2f}%"
+            )
+
 
 def _export_json(rows: List[Dict[str, Any]], path: str) -> None:
     payload = {"merged": rows}
