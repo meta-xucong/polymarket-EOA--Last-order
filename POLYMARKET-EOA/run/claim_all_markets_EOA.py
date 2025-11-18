@@ -233,12 +233,6 @@ def main(argv: List[str]) -> int:
         return 3
     ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CLAIM_ABI)
 
-    # 准备分组
-    if args.from_json:
-        groups = load_claims_from_json(args.from_json)
-    else:
-        groups = fetch_claims_from_data_api(owner, only_redeemable=True, limit=500)
-
     # 无论是否有可兑付市场，都先准备 nonce / gas，用于后续 unwrap 或 claim
     nonce = w3.eth.get_transaction_count(owner)
     gas_price = int(w3.eth.gas_price * max(float(args.gas_mult), 0.1))
@@ -247,6 +241,12 @@ def main(argv: List[str]) -> int:
     claim_error: Optional[Exception] = None
     claim_failures = 0
     try:
+        # 准备分组
+        if args.from_json:
+            groups = load_claims_from_json(args.from_json)
+        else:
+            groups = fetch_claims_from_data_api(owner, only_redeemable=True, limit=500)
+
         if groups:
             print(f"[INFO] 即将处理 {len(groups)} 笔市场 Claim。")
             sent = 0
@@ -336,8 +336,14 @@ def main(argv: List[str]) -> int:
         except Exception:
             dec = 6
         min_units = int(float(args.unwrap_min) * (10 ** dec))
-        delta, txh = unwrap_wcol_all(w3, owner, priv, gas_price, nonce, min_amount_units=min_units)
-        nonce += delta
+        try:
+            delta, txh = unwrap_wcol_all(
+                w3, owner, priv, gas_price, nonce, min_amount_units=min_units
+            )
+            nonce += delta
+        except Exception as exc:
+            print(f"[WARN] 自动 unwrap 流程异常：{exc}。")
+            # unwrap 异常不影响主流程退出码，但会在日志中提示
 
     if claim_error:
         print("[INFO] Claim 流程已执行：退出码 -1。")
