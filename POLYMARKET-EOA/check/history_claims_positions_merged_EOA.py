@@ -426,18 +426,36 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
         r for r in settled_rows if float(r.get("buy_cost_total") or 0.0) > 0.0
     ]
 
-    total_entries = len(main_rows)
-    total_invest = sum(float(r.get("buy_cost_total") or 0.0) for r in main_rows)
-    total_claim = sum(float(r.get("redeem_usdc_total") or 0.0) for r in main_rows)
+    # 异常：单条 ROI 超过 10%
+    abnormal_rows = []
+    for r in main_rows:
+        buy_cost = float(r.get("buy_cost_total") or 0.0)
+        claim_total = float(r.get("redeem_usdc_total") or 0.0)
+        if buy_cost <= 0:
+            continue
+        profit = claim_total - buy_cost
+        roi_each = profit / buy_cost
+        if roi_each > 0.10:
+            abnormal_rows.append(r)
+
+    normal_main_rows = [r for r in main_rows if r not in abnormal_rows]
+
+    total_entries = len(normal_main_rows)
+    total_invest = sum(
+        float(r.get("buy_cost_total") or 0.0) for r in normal_main_rows
+    )
+    total_claim = sum(
+        float(r.get("redeem_usdc_total") or 0.0) for r in normal_main_rows
+    )
     total_profit = total_claim - total_invest
     success_count = sum(
         1
-        for r in main_rows
+        for r in normal_main_rows
         if float(r.get("redeem_usdc_total") or 0.0)
         - float(r.get("buy_cost_total") or 0.0)
         >= 0
     )
-    failure_count = len(main_rows) - success_count
+    failure_count = len(normal_main_rows) - success_count
     roi = (total_profit / total_invest * 100) if total_invest > 0 else 0.0
 
     print("[SUMMARY] 统计概览：")
@@ -477,7 +495,7 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
 
     failure_rows = [
         r
-        for r in main_rows
+        for r in normal_main_rows
         if float(r.get("redeem_usdc_total") or 0.0)
         - float(r.get("buy_cost_total") or 0.0)
         < 0
@@ -485,6 +503,21 @@ def _print_summary(rows: List[Dict[str, Any]]) -> None:
     if failure_rows:
         print("\n[FAILED] 失利条目明细：")
         for idx, row in enumerate(failure_rows, 1):
+            buy_cost = float(row.get("buy_cost_total") or 0.0)
+            claim_total = float(row.get("redeem_usdc_total") or 0.0)
+            profit = claim_total - buy_cost
+            roi_each = (profit / buy_cost * 100) if buy_cost > 0 else 0.0
+            print(
+                f"{idx:>3}. {row.get('title') or '-'} | {row.get('outcome') or '-'} | key={row.get('key')}"
+            )
+            print(
+                "     "
+                f"买入成本≈{buy_cost:.2f} | 总CLAIM≈{claim_total:.2f} | 收益≈{profit:.2f} | 收益率≈{roi_each:.2f}%"
+            )
+
+    if abnormal_rows:
+        print("\n[ABNORMAL] 疑似数据异常条目：")
+        for idx, row in enumerate(abnormal_rows, 1):
             buy_cost = float(row.get("buy_cost_total") or 0.0)
             claim_total = float(row.get("redeem_usdc_total") or 0.0)
             profit = claim_total - buy_cost
