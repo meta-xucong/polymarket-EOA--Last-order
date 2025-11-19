@@ -240,8 +240,9 @@ def main(argv: List[str]) -> int:
         groups = fetch_claims_from_data_api(owner, only_redeemable=True, limit=500)
 
     # 无论是否有可兑付市场，都先准备 nonce / gas，用于后续 unwrap 或 claim
-    nonce = w3.eth.get_transaction_count(owner)
-    gas_price = int(w3.eth.gas_price * max(float(args.gas_mult), 0.1))
+    nonce = w3.eth.get_transaction_count(owner, "pending")
+    gas_mult = max(float(args.gas_mult), 0.1)
+    gas_price = int(w3.eth.gas_price * gas_mult)
 
     # 若有可兑付，先执行 claim；否则仅提示但不退出，让后续 unwrap 生效
     claim_error: Optional[Exception] = None
@@ -287,35 +288,75 @@ def main(argv: List[str]) -> int:
                     continue
 
                 # 上链
-                try:
-                    tx = call.build_transaction({"from": owner, "nonce": nonce, "gasPrice": gas_price})
+                success = False
+                attempts = 0
+                while attempts < 3 and not success:
+                    attempts += 1
                     try:
-                        est = w3.eth.estimate_gas(tx)
-                        tx["gas"] = int(est * 1.2)
-                    except Exception:
-                        tx["gas"] = 200000
-                    signed = w3.eth.account.sign_transaction(tx, private_key=priv)
-                    txh = w3.eth.send_raw_transaction(signed.rawTransaction)
-                    rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=120)
-                    print(f"[INFO] 交易成功 {txh.hex()} | gasUsed={rcpt.gasUsed}")
-                    nonce += 1
-                    sent += 1
-                except Exception as exc:
+                        tx = call.build_transaction({"from": owner, "nonce": nonce, "gasPrice": gas_price})
+                        try:
+                            est = w3.eth.estimate_gas(tx)
+                            tx["gas"] = int(est * 1.2)
+                        except Exception:
+                            tx["gas"] = 200000
+                        signed = w3.eth.account.sign_transaction(tx, private_key=priv)
+                        txh = w3.eth.send_raw_transaction(signed.rawTransaction)
+                        rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=120)
+                        print(f"[INFO] 交易成功 {txh.hex()} | gasUsed={rcpt.gasUsed}")
+                        nonce += 1
+                        sent += 1
+                        success = True
+                    except Exception as exc:
+                        err_lower = str(exc).lower()
+                        refresh_nonce = False
+                        bump_gas = False
+                        if "result for condition not received yet" in err_lower:
+                            print(
+                                "[WARN] redeemPositions 交易失败：预言机结果尚未提交，市场未结算。继续处理下一笔。"
+                            )
+                        elif _looks_like_panic_overflow(exc):
+                            print(
+                                f"[WARN] redeemPositions 被链上拒绝（Panic 0x11，可能已兑付完毕）：{exc}."
+                                " 继续处理下一笔。"
+                            )
+                        else:
+                            print(f"[WARN] redeemPositions 交易失败：{exc}。")
+                            if (
+                                "nonce too low" in err_lower
+                                or "already known" in err_lower
+                                or "replacement transaction underpriced" in err_lower
+                            ):
+                                refresh_nonce = True
+                            if (
+                                "could not replace existing tx" in err_lower
+                                or "replacement transaction underpriced" in err_lower
+                            ):
+                                bump_gas = True
+
+                        if refresh_nonce:
+                            old_nonce = nonce
+                            nonce = w3.eth.get_transaction_count(owner, "pending")
+                            print(f"[INFO] 已刷新 nonce：{old_nonce} -> {nonce}")
+
+                        if bump_gas:
+                            network_gas = int(w3.eth.gas_price * gas_mult)
+                            new_gas = max(int(gas_price * 1.1), int(network_gas * 1.1))
+                            if new_gas == gas_price:
+                                new_gas += 1
+                            print(f"[INFO] 调整 gasPrice：{gas_price} -> {new_gas}")
+                            gas_price = new_gas
+
+                        if refresh_nonce or bump_gas:
+                            print("[INFO] 将重试当前市场……")
+                            continue
+
+                        # 到这里视为不可恢复错误
+                        if not success:
+                            break
+
+                if not success:
                     claim_failures += 1
-                    err_lower = str(exc).lower()
-                    if "result for condition not received yet" in err_lower:
-                        print(
-                            "[WARN] redeemPositions 交易失败：预言机结果尚未提交，市场未结算。继续处理下一笔。"
-                        )
-                    elif _looks_like_panic_overflow(exc):
-                        print(
-                            f"[WARN] redeemPositions 被链上拒绝（Panic 0x11，可能已兑付完毕）：{exc}."
-                            " 继续处理下一笔。"
-                        )
-                    else:
-                        print(f"[WARN] redeemPositions 交易失败：{exc}。继续处理下一笔。")
-                    # nonce 只有在交易成功广播并返回 receipt 时才增加
-                    continue
+                    print("[WARN] 本市场 Claim 未成功，已跳过。")
 
             print("-"*72)
             print(f"[DONE] Claim 流程结束，发送交易 {sent} 笔。")
@@ -336,6 +377,7 @@ def main(argv: List[str]) -> int:
         except Exception:
             dec = 6
         min_units = int(float(args.unwrap_min) * (10 ** dec))
+        nonce = w3.eth.get_transaction_count(owner, "pending")
         delta, txh = unwrap_wcol_all(w3, owner, priv, gas_price, nonce, min_amount_units=min_units)
         nonce += delta
 
