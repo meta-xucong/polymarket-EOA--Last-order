@@ -29,6 +29,7 @@ except Exception as e:
 DEFAULT_MIN_END_HOURS: float = 1.0
 DEFAULT_MAX_END_DAYS: int   = 2
 DEFAULT_GAMMA_WINDOW_DAYS: int = 2
+DEFAULT_GAMMA_MIN_WINDOW_HOURS: int = 1
 DEFAULT_LEGACY_END_DAYS: int  = 730
 
 # 高亮（严格口径）集中参数
@@ -204,22 +205,27 @@ def _gamma_fetch(params: Dict[str, str]) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-def fetch_markets_windowed(end_min: dt.datetime, end_max: dt.datetime, window_days: int = 14) -> List[Dict[str, Any]]:
+def fetch_markets_windowed(
+    end_min: dt.datetime,
+    end_max: dt.datetime,
+    *,
+    window_days: int = 14,
+    min_window_hours: int = DEFAULT_GAMMA_MIN_WINDOW_HOURS,
+) -> List[Dict[str, Any]]:
     all_mkts: List[Dict[str, Any]] = []
     seen: set = set()
-    cur = end_min
     one_sec = dt.timedelta(seconds=1)
+    min_window = dt.timedelta(hours=max(1, int(min_window_hours)))
 
-    while cur <= end_max:
-        sub_end = min(cur + dt.timedelta(days=window_days), end_max)
+    def _process_interval(start: dt.datetime, end: dt.datetime) -> None:
         params = {
             "limit": "500",
             "order": "endDate",
             "ascending": "true",
             "active": "true",
             "closed": "false",
-            "end_date_min": cur.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "end_date_max": sub_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date_min": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date_max": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         chunk = _gamma_fetch(params)
 
@@ -229,15 +235,33 @@ def fetch_markets_windowed(end_min: dt.datetime, end_max: dt.datetime, window_da
                 seen.add(mid)
                 all_mkts.append(m)
 
-        if len(chunk) >= 500 and window_days > 1:
-            half = max(1, window_days // 2)
-            sub = fetch_markets_windowed(cur, sub_end, window_days=half)
-            for m in sub:
-                mid = m.get("id") or m.get("slug")
-                if mid and mid not in seen:
-                    seen.add(mid)
-                    all_mkts.append(m)
+        if not chunk:
+            return
 
+        duration = end - start
+        hit_limit = len(chunk) >= 500
+
+        if hit_limit and duration > min_window:
+            mid_point = start + dt.timedelta(seconds=duration.total_seconds() / 2)
+            left_end = min(mid_point, end)
+            right_start = left_end + one_sec
+            if start < left_end:
+                _process_interval(start, left_end)
+            if right_start <= end:
+                _process_interval(right_start, end)
+            return
+
+        if hit_limit:
+            last_end = _parse_dt(chunk[-1].get("endDate") or chunk[-1].get("end_time") or chunk[-1].get("endTime"))
+            if last_end is not None:
+                next_start = last_end + one_sec
+                if next_start <= end:
+                    _process_interval(next_start, end)
+
+    cur = end_min
+    while cur <= end_max:
+        sub_end = min(cur + dt.timedelta(days=window_days), end_max)
+        _process_interval(cur, sub_end)
         cur = sub_end + one_sec
 
     return all_mkts
@@ -544,6 +568,7 @@ def collect_filter_results(
     min_end_hours: float = DEFAULT_MIN_END_HOURS,
     max_end_days: int = DEFAULT_MAX_END_DAYS,
     gamma_window_days: int = DEFAULT_GAMMA_WINDOW_DAYS,
+    gamma_min_window_hours: int = DEFAULT_GAMMA_MIN_WINDOW_HOURS,
     legacy_end_days: int = DEFAULT_LEGACY_END_DAYS,
     allow_illiquid: bool = False,
     skip_orderbook: bool = False,
@@ -558,7 +583,12 @@ def collect_filter_results(
         now = _now_utc()
         end_min = now + dt.timedelta(hours=min_end_hours)
         end_max = now + dt.timedelta(days=max_end_days)
-        mkts_raw = fetch_markets_windowed(end_min, end_max, window_days=gamma_window_days)
+        mkts_raw = fetch_markets_windowed(
+            end_min,
+            end_max,
+            window_days=gamma_window_days,
+            min_window_hours=gamma_min_window_hours,
+        )
     else:
         mkts_raw = prefetched_markets
 
@@ -636,6 +666,7 @@ def main():
     ap.add_argument("--min-end-hours", type=float, default=DEFAULT_MIN_END_HOURS, help="仅抓取结束时间晚于该阈值（小时）的市场")
     ap.add_argument("--max-end-days", type=int, default=DEFAULT_MAX_END_DAYS, help="仅抓取结束时间在未来 N 天内的市场")
     ap.add_argument("--gamma-window-days", type=int, default=DEFAULT_GAMMA_WINDOW_DAYS, help="Gamma 时间切片的窗口大小（天），命中 500 会自动递归切分")
+    ap.add_argument("--gamma-min-window-hours", type=int, default=DEFAULT_GAMMA_MIN_WINDOW_HOURS, help="Gamma 时间切片命中 500 时递归拆分的最小窗口（小时）；窗口缩到该级别仍满额会按 endDate 继续分页")
 
     ap.add_argument("--legacy-end-days", type=int, default=DEFAULT_LEGACY_END_DAYS, help="结束早于 N 天视为旧格式/归档（默认 730 天）")
 
@@ -669,8 +700,13 @@ def main():
     end_min = now + dt.timedelta(hours=args.min_end_hours)
     end_max = now + dt.timedelta(days=args.max_end_days)
 
-    mkts_raw = fetch_markets_windowed(end_min, end_max, window_days=args.gamma_window_days)
-    print(f"[TRACE] 采用时间切片抓取完成：共获取 {len(mkts_raw)} 条（窗口={args.gamma_window_days} 天）")
+    mkts_raw = fetch_markets_windowed(
+        end_min,
+        end_max,
+        window_days=args.gamma_window_days,
+        min_window_hours=args.gamma_min_window_hours,
+    )
+    print(f"[TRACE] 采用时间切片抓取完成：共获取 {len(mkts_raw)} 条（窗口={args.gamma_window_days} 天，最小窗口={args.gamma_min_window_hours} 小时）")
 
     only_pat = args.only.lower().strip()
 
@@ -731,6 +767,7 @@ def main():
         min_end_hours=args.min_end_hours,
         max_end_days=args.max_end_days,
         gamma_window_days=args.gamma_window_days,
+        gamma_min_window_hours=args.gamma_min_window_hours,
         legacy_end_days=args.legacy_end_days,
         allow_illiquid=args.allow_illiquid,
         skip_orderbook=args.skip_orderbook,
